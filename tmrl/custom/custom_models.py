@@ -525,15 +525,18 @@ class VanillaCNN(Module):
         self.h_out, self.w_out = conv2d_out_dims(self.conv4, self.h_out, self.w_out)
         self.out_channels = self.conv4.out_channels
         self.flat_features = self.out_channels * self.h_out * self.w_out
-        self.mlp_input_features = self.flat_features + 12 if self.q_net else self.flat_features + 9
+        if cfg.PRAGMA_LIDARCNN:
+            self.mlp_input_features = self.flat_features + 31 if self.q_net else self.flat_features + 28
+        else:
+            self.mlp_input_features = self.flat_features + 12 if self.q_net else self.flat_features + 9
         self.mlp_layers = [256, 256, 1] if self.q_net else [256, 256]
         self.mlp = mlp([self.mlp_input_features] + self.mlp_layers, nn.ReLU)
 
     def forward(self, x):
         if self.q_net:
-            speed, gear, rpm, images, act1, act2, act = x
+            speed, gear, rpm, images, *args = x
         else:
-            speed, gear, rpm, images, act1, act2 = x
+            speed, gear, rpm, images, *args = x
 
         x = F.relu(self.conv1(images))
         x = F.relu(self.conv2(x))
@@ -543,9 +546,9 @@ class VanillaCNN(Module):
         assert flat_features == self.flat_features, f"x.shape:{x.shape}, flat_features:{flat_features}, self.out_channels:{self.out_channels}, self.h_out:{self.h_out}, self.w_out:{self.w_out}"
         x = x.view(-1, flat_features)
         if self.q_net:
-            x = torch.cat((speed, gear, rpm, x, act1, act2, act), -1)
+            x = torch.cat((speed, gear, rpm, x, *args), -1)
         else:
-            x = torch.cat((speed, gear, rpm, x, act1, act2), -1)
+            x = torch.cat((speed, gear, rpm, x, *args), -1)
         x = self.mlp(x)
         return x
 
@@ -660,6 +663,211 @@ class VanillaColorCNNActorCritic(VanillaCNNActorCritic):
         self.actor = SquashedGaussianVanillaColorCNNActor(observation_space, action_space)
         self.q1 = VanillaColorCNNQFunction(observation_space, action_space)
         self.q2 = VanillaColorCNNQFunction(observation_space, action_space)
+
+
+class REDQVanillaCNNActorCritic(nn.Module):
+    def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU, n=10):
+        super().__init__()
+        self.actor = SquashedGaussianVanillaCNNActor(observation_space, action_space)
+        self.n = n
+        self.qs = ModuleList([VanillaCNNQFunction(observation_space, action_space) for _ in range(self.n)])
+
+    def act(self, obs, test=False):
+        with torch.no_grad():
+            a, _ = self.actor(obs, test, False)
+            return a.squeeze().cpu().numpy()
+
+
+class REDQVanillaColorCNNActorCritic(nn.Module):
+    def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU, n=10):
+        super().__init__()
+        self.actor = SquashedGaussianVanillaColorCNNActor(observation_space, action_space)
+        self.n = n
+        self.qs = ModuleList([VanillaColorCNNQFunction(observation_space, action_space) for _ in range(self.n)])
+
+    def act(self, obs, test=False):
+        with torch.no_grad():
+            a, _ = self.actor(obs, test, False)
+            return a.squeeze().cpu().numpy()
+
+
+# ===========================================================================================================
+# LATE FUSION TWIN ENCODER ARCHITECTURE
+# Research-based multi-modal fusion with dedicated encoders for Camera and LIDAR
+# ===========================================================================================================
+
+class LidarEncoder(Module):
+    """Dedicated encoder for LIDAR distance measurements."""
+    def __init__(self, input_dim=19, hidden_dim=64, output_dim=64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.ReLU(),
+        )
+    
+    def forward(self, lidar):
+        return self.encoder(lidar)
+
+
+class LateFusionCNN(Module):
+    """
+    Late Fusion Twin Encoder Architecture.
+    
+    Features:
+    - No normalization (BatchNorm/InstanceNorm removed to avoid 1x1 spatial errors)
+    - Dedicated LIDAR encoder (not just raw concatenation)
+    - Compatible with VanillaCNN's input format
+    """
+    def __init__(self, q_net):
+        super(LateFusionCNN, self).__init__()
+        self.q_net = q_net
+        self.h_out, self.w_out = cfg.IMG_HEIGHT, cfg.IMG_WIDTH
+        hist = cfg.IMG_HIST_LEN
+
+        # CNN Encoder for Images (No Norm to avoid 1x1 spatial errors)
+        self.conv1 = Conv2d(hist, 64, 8, stride=2)
+        self.h_out, self.w_out = conv2d_out_dims(self.conv1, self.h_out, self.w_out)
+        
+        self.conv2 = Conv2d(64, 64, 4, stride=2)
+        self.h_out, self.w_out = conv2d_out_dims(self.conv2, self.h_out, self.w_out)
+        
+        self.conv3 = Conv2d(64, 128, 4, stride=2)
+        self.h_out, self.w_out = conv2d_out_dims(self.conv3, self.h_out, self.w_out)
+        
+        self.conv4 = Conv2d(128, 128, 4, stride=2)
+        self.h_out, self.w_out = conv2d_out_dims(self.conv4, self.h_out, self.w_out)
+        
+        self.out_channels = self.conv4.out_channels
+        self.flat_features = self.out_channels * self.h_out * self.w_out
+        
+        # Dedicated LIDAR encoder (19 beams -> 64 features)
+        self.lidar_encoder = LidarEncoder(input_dim=19, hidden_dim=64, output_dim=64)
+        
+        # Calculate fusion input size to match VanillaCNN format
+        self.mlp_input_features = self.flat_features + 3 + 64 + 6  # speed/gear/rpm + lidar_enc + act_buf
+        if self.q_net:
+            self.mlp_input_features += 3  # action
+        
+        # Fusion MLP
+        self.mlp_layers = [256, 256, 1] if self.q_net else [256, 256]
+        self.mlp = mlp([self.mlp_input_features] + self.mlp_layers, nn.ReLU)
+
+    def forward(self, x):
+        if self.q_net:
+            speed, gear, rpm, images, lidar, act_buf, action = x
+        else:
+            speed, gear, rpm, images, lidar, act_buf = x[0], x[1], x[2], x[3], x[4], x[5]
+
+        # CNN forward pass without normalization
+        img_feat = F.relu(self.conv1(images))
+        img_feat = F.relu(self.conv2(img_feat))
+        img_feat = F.relu(self.conv3(img_feat))
+        img_feat = F.relu(self.conv4(img_feat))
+        img_feat = img_feat.view(-1, self.flat_features)
+        
+        # LIDAR encoding
+        lidar_feat = self.lidar_encoder(lidar)
+        
+        # Flatten action buffer
+        act_buf_flat = act_buf.view(act_buf.size(0), -1)
+        
+        # Late fusion: concatenate all features
+        if self.q_net:
+            fused = torch.cat((speed, gear, rpm, img_feat, lidar_feat, act_buf_flat, action), dim=-1)
+        else:
+            fused = torch.cat((speed, gear, rpm, img_feat, lidar_feat, act_buf_flat), dim=-1)
+        
+        # Final MLP
+        out = self.mlp(fused)
+        return out
+
+
+class SquashedGaussianLateFusionActor(TorchActorModule):
+    """Actor using Late Fusion Twin Encoder architecture."""
+    def __init__(self, observation_space, action_space):
+        super().__init__(observation_space, action_space)
+        dim_act = action_space.shape[0]
+        act_limit = action_space.high[0]
+        self.net = LateFusionCNN(q_net=False)
+        self.mu_layer = nn.Linear(256, dim_act)
+        self.log_std_layer = nn.Linear(256, dim_act)
+        self.act_limit = act_limit
+
+    def forward(self, obs, test=False, with_logprob=True):
+        net_out = self.net(obs)
+        mu = self.mu_layer(net_out)
+        log_std = self.log_std_layer(net_out)
+        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        std = torch.exp(log_std)
+
+        pi_distribution = Normal(mu, std)
+        if test:
+            pi_action = mu
+        else:
+            pi_action = pi_distribution.rsample()
+
+        if with_logprob:
+            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
+            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
+        else:
+            logp_pi = None
+
+        pi_action = torch.tanh(pi_action)
+        pi_action = self.act_limit * pi_action
+
+        return pi_action, logp_pi
+
+    def act(self, obs, test=False):
+        with torch.no_grad():
+            a, _ = self.forward(obs, test, False)
+            return a.squeeze().cpu().numpy()
+
+
+class LateFusionQFunction(nn.Module):
+    """Q-function using Late Fusion Twin Encoder architecture."""
+    def __init__(self, observation_space, action_space):
+        super().__init__()
+        self.net = LateFusionCNN(q_net=True)
+
+    def forward(self, obs, act):
+        x = (*obs, act)
+        q = self.net(x)
+        return torch.squeeze(q, -1)
+
+
+class LateFusionActorCritic(nn.Module):
+    """SAC Actor-Critic with Late Fusion Twin Encoder."""
+    def __init__(self, observation_space, action_space):
+        super().__init__()
+        self.actor = SquashedGaussianLateFusionActor(observation_space, action_space)
+        self.q1 = LateFusionQFunction(observation_space, action_space)
+        self.q2 = LateFusionQFunction(observation_space, action_space)
+
+    def act(self, obs, test=False):
+        with torch.no_grad():
+            a, _ = self.actor(obs, test, False)
+            return a.squeeze().cpu().numpy()
+
+
+class REDQLateFusionActorCritic(nn.Module):
+    """REDQ-SAC Actor-Critic with Late Fusion Twin Encoder architecture."""
+    def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU, n=10):
+        super().__init__()
+        self.actor = SquashedGaussianLateFusionActor(observation_space, action_space)
+        self.n = n
+        self.qs = ModuleList([LateFusionQFunction(observation_space, action_space) for _ in range(self.n)])
+
+    def act(self, obs, test=False):
+        with torch.no_grad():
+            a, _ = self.actor(obs, test, False)
+            return a.squeeze().cpu().numpy()
 
 
 # UNSUPPORTED ==========================================================================================================

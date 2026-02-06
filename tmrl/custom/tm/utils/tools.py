@@ -103,8 +103,8 @@ class Lidar:
         h, w, _ = im.shape
         self.h = h
         self.w = w
-        self.road_point = (44*h//49, w//2)
-        min_dist = 20
+        self.road_point = (30*h//49, w//2)
+        min_dist = 24
         list_ax_x = []
         list_ax_y = []
         for angle in range(90, 280, 10):

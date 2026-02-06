@@ -318,7 +318,7 @@ class REDQSACAgent(TrainingAgent):
     def __post_init__(self):
         observation_space, action_space = self.observation_space, self.action_space
         device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
-        model = self.model_cls(observation_space, action_space)
+        model = self.model_cls(observation_space, action_space, n=self.n)
         logging.debug(f" device REDQ-SAC: {device}")
         self.model = model.to(device)
         self.model_target = no_grad(deepcopy(self.model))
@@ -355,9 +355,10 @@ class REDQSACAgent(TrainingAgent):
         # FIXME? log_prob = log_prob.reshape(-1, 1)
 
         loss_alpha = None
-        if self.learn_entropy_coef and update_policy:
+        if self.learn_entropy_coef:
             alpha_t = torch.exp(self.log_alpha.detach())
-            loss_alpha = -(self.log_alpha * (logp_pi + self.target_entropy).detach()).mean()
+            if update_policy:
+                loss_alpha = -(self.log_alpha * (logp_pi + self.target_entropy).detach()).mean()
         else:
             alpha_t = self.alpha_t
 
@@ -419,7 +420,8 @@ class REDQSACAgent(TrainingAgent):
         )
 
         if self.learn_entropy_coef:
-            ret_dict["loss_entropy_coef"] = loss_alpha.detach().item()
+            if loss_alpha is not None:
+                ret_dict["loss_entropy_coef"] = loss_alpha.detach().item()
             ret_dict["entropy_coef"] = alpha_t.item()
 
         return ret_dict

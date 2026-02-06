@@ -24,11 +24,23 @@ def obs_preprocessor_tm_lidar_act_in_obs(obs):
     return obs
 
 
+
 def obs_preprocessor_tm_lidar_progress_act_in_obs(obs):
     """
     Preprocessor for the LIDAR environment, flattening LIDARs
     """
     obs = (obs[0], obs[1], np.ndarray.flatten(obs[2]), *obs[3:])  # >= 1  action
+    return obs
+
+
+def obs_preprocessor_tm_lidar_cnn_act_in_obs(obs):
+    """
+    Preprocessor for the LIDAR+CNN environment
+    """
+    grayscale_images = obs[3]
+    grayscale_images = grayscale_images.astype(np.float32) / 256.0
+    lidars = np.ndarray.flatten(obs[4])
+    obs = (obs[0] / 1000.0, obs[1] / 10.0, obs[2] / 10000.0, grayscale_images, lidars, *obs[5:])
     return obs
 
 

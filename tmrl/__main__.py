@@ -59,7 +59,10 @@ def main(args):
     elif args.record_reward:
         record_reward_dist(path_reward=cfg.REWARD_PATH, use_keyboard=args.use_keyboard)
     elif args.check_env:
-        if cfg.PRAGMA_LIDAR:
+        if cfg.PRAGMA_LIDARCNN:
+            from tmrl.tools.check_environment import check_env_tm20lidar_cnn
+            check_env_tm20lidar_cnn()
+        elif cfg.PRAGMA_LIDAR:
             check_env_tm20lidar()
         else:
             check_env_tm20full()

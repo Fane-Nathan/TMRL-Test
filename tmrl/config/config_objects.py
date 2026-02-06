@@ -7,11 +7,11 @@ import rtgym
 # local imports
 import tmrl.config.config_constants as cfg
 from tmrl.training_offline import TorchTrainingOffline
-from tmrl.custom.tm.tm_gym_interfaces import TM2020Interface, TM2020InterfaceLidar, TM2020InterfaceLidarProgress
-from tmrl.custom.custom_memories import MemoryTMFull, MemoryTMLidar, MemoryTMLidarProgress, get_local_buffer_sample_lidar, get_local_buffer_sample_lidar_progress, get_local_buffer_sample_tm20_imgs
-from tmrl.custom.tm.tm_preprocessors import obs_preprocessor_tm_act_in_obs, obs_preprocessor_tm_lidar_act_in_obs, obs_preprocessor_tm_lidar_progress_act_in_obs
+from tmrl.custom.tm.tm_gym_interfaces import TM2020Interface, TM2020InterfaceLidar, TM2020InterfaceLidarProgress, TM2020InterfaceLidarCnn
+from tmrl.custom.custom_memories import MemoryTMFull, MemoryTMLidar, MemoryTMLidarProgress, MemoryTMLidarCnn, get_local_buffer_sample_lidar, get_local_buffer_sample_lidar_progress, get_local_buffer_sample_tm20_imgs, get_local_buffer_sample_lidar_cnn
+from tmrl.custom.tm.tm_preprocessors import obs_preprocessor_tm_act_in_obs, obs_preprocessor_tm_lidar_act_in_obs, obs_preprocessor_tm_lidar_progress_act_in_obs, obs_preprocessor_tm_lidar_cnn_act_in_obs
 from tmrl.envs import GenericGymEnv
-from tmrl.custom.custom_models import SquashedGaussianMLPActor, MLPActorCritic, REDQMLPActorCritic, RNNActorCritic, SquashedGaussianRNNActor, SquashedGaussianVanillaCNNActor, VanillaCNNActorCritic, SquashedGaussianVanillaColorCNNActor, VanillaColorCNNActorCritic
+from tmrl.custom.custom_models import SquashedGaussianMLPActor, MLPActorCritic, REDQMLPActorCritic, RNNActorCritic, SquashedGaussianRNNActor, SquashedGaussianVanillaCNNActor, VanillaCNNActorCritic, SquashedGaussianVanillaColorCNNActor, VanillaColorCNNActorCritic, REDQVanillaCNNActorCritic, REDQVanillaColorCNNActorCritic, LateFusionActorCritic, REDQLateFusionActorCritic, SquashedGaussianLateFusionActor
 from tmrl.custom.custom_algorithms import SpinupSacAgent as SAC_Agent
 from tmrl.custom.custom_algorithms import REDQSACAgent as REDQ_Agent
 from tmrl.custom.custom_checkpoints import update_run_instance
@@ -30,18 +30,29 @@ if cfg.PRAGMA_LIDAR:
         assert ALG_NAME == "SAC", f"{ALG_NAME} is not implemented here."
         TRAIN_MODEL = RNNActorCritic
         POLICY = SquashedGaussianRNNActor
+    elif cfg.PRAGMA_LIDARCNN:
+        # Use Late Fusion Twin Encoder architecture for LIDAR+CNN
+        if ALG_NAME == "SAC":
+            TRAIN_MODEL = LateFusionActorCritic
+        else:
+            TRAIN_MODEL = REDQLateFusionActorCritic
+        POLICY = SquashedGaussianLateFusionActor
     else:
         TRAIN_MODEL = MLPActorCritic if ALG_NAME == "SAC" else REDQMLPActorCritic
         POLICY = SquashedGaussianMLPActor
 else:
     assert not cfg.PRAGMA_RNN, "RNNs not supported yet"
-    assert ALG_NAME == "SAC", f"{ALG_NAME} is not implemented here."
-    TRAIN_MODEL = VanillaCNNActorCritic if cfg.GRAYSCALE else VanillaColorCNNActorCritic
+    if ALG_NAME == "SAC":
+        TRAIN_MODEL = VanillaCNNActorCritic if cfg.GRAYSCALE else VanillaColorCNNActorCritic
+    else:
+        TRAIN_MODEL = REDQVanillaCNNActorCritic if cfg.GRAYSCALE else REDQVanillaColorCNNActorCritic
     POLICY = SquashedGaussianVanillaCNNActor if cfg.GRAYSCALE else SquashedGaussianVanillaColorCNNActor
 
 if cfg.PRAGMA_LIDAR:
     if cfg.PRAGMA_PROGRESS:
         INT = partial(TM2020InterfaceLidarProgress, img_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD)
+    elif cfg.PRAGMA_LIDARCNN:
+        INT = partial(TM2020InterfaceLidarCnn, img_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD, grayscale=cfg.GRAYSCALE, resize_to=(cfg.IMG_WIDTH, cfg.IMG_HEIGHT))
     else:
         INT = partial(TM2020InterfaceLidar, img_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD)
 else:
@@ -61,6 +72,8 @@ for k, v in CONFIG_DICT_MODIFIERS.items():
 if cfg.PRAGMA_LIDAR:
     if cfg.PRAGMA_PROGRESS:
         SAMPLE_COMPRESSOR = get_local_buffer_sample_lidar_progress
+    elif cfg.PRAGMA_LIDARCNN:
+        SAMPLE_COMPRESSOR = get_local_buffer_sample_lidar_cnn
     else:
         SAMPLE_COMPRESSOR = get_local_buffer_sample_lidar
 else:
@@ -70,6 +83,8 @@ else:
 if cfg.PRAGMA_LIDAR:
     if cfg.PRAGMA_PROGRESS:
         OBS_PREPROCESSOR = obs_preprocessor_tm_lidar_progress_act_in_obs
+    elif cfg.PRAGMA_LIDARCNN:
+        OBS_PREPROCESSOR = obs_preprocessor_tm_lidar_cnn_act_in_obs
     else:
         OBS_PREPROCESSOR = obs_preprocessor_tm_lidar_act_in_obs
 else:
@@ -85,6 +100,8 @@ if cfg.PRAGMA_LIDAR:
     else:
         if cfg.PRAGMA_PROGRESS:
             MEM = MemoryTMLidarProgress
+        elif cfg.PRAGMA_LIDARCNN:
+            MEM = MemoryTMLidarCnn
         else:
             MEM = MemoryTMLidar
 else:
