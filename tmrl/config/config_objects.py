@@ -1,0 +1,261 @@
+# third-party imports
+# from tmrl.custom.custom_checkpoints import load_run_instance_images_dataset, dump_run_instance_images_dataset
+# third-party imports
+
+import rtgym
+
+# local imports
+import tmrl.config.config_constants as cfg
+from tmrl.training_offline import TorchTrainingOffline
+from tmrl.custom.tm.tm_gym_interfaces import TM2020Interface, TM2020InterfaceLidar, TM2020InterfaceLidarProgress, TM2020InterfaceHybrid
+from tmrl.custom.custom_memories import MemoryTMFull, MemoryTMLidar, MemoryTMLidarProgress, MemoryTMHybrid, get_local_buffer_sample_lidar, get_local_buffer_sample_lidar_progress, get_local_buffer_sample_tm20_imgs, get_local_buffer_sample_tm20_hybrid
+from tmrl.custom.tm.tm_preprocessors import obs_preprocessor_tm_act_in_obs, obs_preprocessor_tm_lidar_act_in_obs, obs_preprocessor_tm_lidar_progress_act_in_obs, obs_preprocessor_tm_hybrid
+from tmrl.envs import GenericGymEnv
+from tmrl.custom.custom_models import SquashedGaussianMLPActor, MLPActorCritic, REDQMLPActorCritic, RNNActorCritic, SquashedGaussianRNNActor, SquashedGaussianVanillaCNNActor, VanillaCNNActorCritic, SquashedGaussianVanillaColorCNNActor, VanillaColorCNNActorCritic, HybridNanoEffNetActor, HybridNanoEffNetActorCritic, REDQHybridNanoEffNetActorCritic, SharedBackboneHybridActorCritic, SharedBackboneHybridActor, DroQHybridActorCritic, ContextualDroQHybridActorCritic, ContextualSharedBackboneHybridActor
+from tmrl.custom.custom_algorithms import SpinupSacAgent as SAC_Agent
+from tmrl.custom.custom_algorithms import REDQSACAgent as REDQ_Agent
+from tmrl.custom.custom_algorithms import SharedBackboneREDQSACAgent as SharedBackbone_Agent
+from tmrl.custom.custom_algorithms import DroQSACAgent as DroQ_Agent
+from tmrl.custom.custom_checkpoints import update_run_instance
+from tmrl.util import partial
+
+
+ALG_CONFIG = cfg.TMRL_CONFIG["ALG"]
+ALG_NAME = ALG_CONFIG["ALGORITHM"]
+assert ALG_NAME in ["SAC", "REDQSAC", "DROQSAC"], f"If you wish to implement {ALG_NAME}, do not use 'ALG' in config.json for that."
+
+
+# MODEL, GYM ENVIRONMENT, REPLAY MEMORY AND TRAINING: ===========
+
+PRAGMA_HYBRID = False
+if "RTGYM_CONFIG" in cfg.ENV_CONFIG:
+    # RTGYM_INTERFACE is likely nested or we access it from cfg directly if available.
+    # config_constants.py usually loads config.json into TMRL_CONFIG.
+    # Let's assume cfg.ENV_CONFIG has the interface if we check config.json structure.
+    # In config.json: "ENV": { "RTGYM_INTERFACE": ... }
+    # In config_constants.py: ENV_CONFIG = TMRL_CONFIG["ENV"]
+    if "RTGYM_INTERFACE" in cfg.ENV_CONFIG:
+         PRAGMA_HYBRID = cfg.ENV_CONFIG["RTGYM_INTERFACE"] == "TM2020HYBRID"
+
+if cfg.PRAGMA_LIDAR:
+    if cfg.PRAGMA_RNN:
+        assert ALG_NAME == "SAC", f"{ALG_NAME} is not implemented here."
+        TRAIN_MODEL = RNNActorCritic
+        POLICY = SquashedGaussianRNNActor
+    else:
+        TRAIN_MODEL = MLPActorCritic if ALG_NAME == "SAC" else REDQMLPActorCritic
+        POLICY = SquashedGaussianMLPActor
+elif PRAGMA_HYBRID:
+    # === HYBRID CONFIGURATION ===
+    if ALG_NAME == "DROQSAC":
+        TRAIN_MODEL = ContextualDroQHybridActorCritic  # DroQ + Context Encoder + Fusion Gate
+        POLICY = ContextualSharedBackboneHybridActor
+    else:
+        TRAIN_MODEL = SharedBackboneHybridActorCritic  # REDQSAC: N Q-networks with shared backbone
+        POLICY = SharedBackboneHybridActor
+else:
+    assert not cfg.PRAGMA_RNN, "RNNs not supported yet"
+    # Use HybridNanoEffNet for VRAM-efficient CNN with SE attention
+    if ALG_NAME == "SAC":
+        TRAIN_MODEL = HybridNanoEffNetActorCritic
+    else:  # REDQSAC
+        TRAIN_MODEL = REDQHybridNanoEffNetActorCritic
+    POLICY = HybridNanoEffNetActor
+
+if cfg.PRAGMA_LIDAR:
+    if cfg.PRAGMA_PROGRESS:
+        INT = partial(TM2020InterfaceLidarProgress, img_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD)
+    else:
+        INT = partial(TM2020InterfaceLidar, img_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD)
+elif PRAGMA_HYBRID:
+    INT = partial(TM2020InterfaceHybrid,
+                  img_hist_len=cfg.IMG_HIST_LEN,
+                  gamepad=cfg.PRAGMA_GAMEPAD,
+                  grayscale=cfg.GRAYSCALE,
+                  resize_to=(cfg.IMG_WIDTH, cfg.IMG_HEIGHT))
+else:
+    INT = partial(TM2020Interface,
+                  img_hist_len=cfg.IMG_HIST_LEN,
+                  gamepad=cfg.PRAGMA_GAMEPAD,
+                  grayscale=cfg.GRAYSCALE,
+                  resize_to=(cfg.IMG_WIDTH, cfg.IMG_HEIGHT))
+
+CONFIG_DICT = rtgym.DEFAULT_CONFIG_DICT.copy()
+CONFIG_DICT["interface"] = INT
+CONFIG_DICT_MODIFIERS = cfg.ENV_CONFIG["RTGYM_CONFIG"]
+for k, v in CONFIG_DICT_MODIFIERS.items():
+    CONFIG_DICT[k] = v
+
+# to compress a sample before sending it over the local network/Internet:
+if cfg.PRAGMA_LIDAR:
+    if cfg.PRAGMA_PROGRESS:
+        SAMPLE_COMPRESSOR = get_local_buffer_sample_lidar_progress
+    else:
+        SAMPLE_COMPRESSOR = get_local_buffer_sample_lidar
+elif PRAGMA_HYBRID:
+    SAMPLE_COMPRESSOR = get_local_buffer_sample_tm20_hybrid
+else:
+    SAMPLE_COMPRESSOR = get_local_buffer_sample_tm20_imgs
+
+# to preprocess observations that come out of the gymnasium environment:
+if cfg.PRAGMA_LIDAR:
+    if cfg.PRAGMA_PROGRESS:
+        OBS_PREPROCESSOR = obs_preprocessor_tm_lidar_progress_act_in_obs
+    else:
+        OBS_PREPROCESSOR = obs_preprocessor_tm_lidar_act_in_obs
+elif PRAGMA_HYBRID:
+    OBS_PREPROCESSOR = obs_preprocessor_tm_hybrid
+else:
+    OBS_PREPROCESSOR = obs_preprocessor_tm_act_in_obs
+# to augment data that comes out of the replay buffer:
+SAMPLE_PREPROCESSOR = None
+
+assert not cfg.PRAGMA_RNN, "RNNs not supported yet"
+
+if cfg.PRAGMA_LIDAR:
+    if cfg.PRAGMA_RNN:
+        assert False, "not implemented"
+    else:
+        if cfg.PRAGMA_PROGRESS:
+            MEM = MemoryTMLidarProgress
+        else:
+            MEM = MemoryTMLidar
+elif PRAGMA_HYBRID:
+    MEM = MemoryTMHybrid
+else:
+    MEM = MemoryTMFull
+
+MEMORY = partial(MEM,
+                 memory_size=cfg.TMRL_CONFIG["MEMORY_SIZE"],
+                 batch_size=cfg.TMRL_CONFIG["BATCH_SIZE"],
+                 sample_preprocessor=SAMPLE_PREPROCESSOR,
+                 dataset_path=cfg.DATASET_PATH,
+                 imgs_obs=cfg.IMG_HIST_LEN,
+                 act_buf_len=cfg.ACT_BUF_LEN,
+                 crc_debug=cfg.CRC_DEBUG)
+
+# ALGORITHM: ===================================================
+
+if ALG_NAME == "SAC":
+    AGENT = partial(
+        SAC_Agent,
+        device='cuda' if cfg.CUDA_TRAINING else 'cpu',
+        model_cls=TRAIN_MODEL,
+        lr_actor=ALG_CONFIG["LR_ACTOR"],
+        lr_critic=ALG_CONFIG["LR_CRITIC"],
+        lr_entropy=ALG_CONFIG["LR_ENTROPY"],
+        gamma=ALG_CONFIG["GAMMA"],
+        polyak=ALG_CONFIG["POLYAK"],
+        learn_entropy_coef=ALG_CONFIG["LEARN_ENTROPY_COEF"],  # False for SAC v2 with no temperature autotuning
+        target_entropy=ALG_CONFIG["TARGET_ENTROPY"],  # None for automatic
+        alpha=ALG_CONFIG["ALPHA"],  # inverse of reward scale
+        optimizer_actor=ALG_CONFIG["OPTIMIZER_ACTOR"],
+        optimizer_critic=ALG_CONFIG["OPTIMIZER_CRITIC"],
+        betas_actor=ALG_CONFIG["BETAS_ACTOR"] if "BETAS_ACTOR" in ALG_CONFIG else None,
+        betas_critic=ALG_CONFIG["BETAS_CRITIC"] if "BETAS_CRITIC" in ALG_CONFIG else None,
+        l2_actor=ALG_CONFIG["L2_ACTOR"] if "L2_ACTOR" in ALG_CONFIG else None,
+        l2_critic=ALG_CONFIG["L2_CRITIC"] if "L2_CRITIC" in ALG_CONFIG else None
+    )
+elif PRAGMA_HYBRID:
+    # Use appropriate agent for VRAM-optimized training
+    if ALG_NAME == "DROQSAC":
+        # DroQ: 2 Q-networks with Dropout+LayerNorm, high UTD
+        AGENT = partial(
+            DroQ_Agent,
+            device='cuda' if cfg.CUDA_TRAINING else 'cpu',
+            model_cls=TRAIN_MODEL,
+            lr_actor=ALG_CONFIG["LR_ACTOR"],
+            lr_critic=ALG_CONFIG["LR_CRITIC"],
+            lr_entropy=ALG_CONFIG["LR_ENTROPY"],
+            gamma=ALG_CONFIG["GAMMA"],
+            polyak=ALG_CONFIG["POLYAK"],
+            learn_entropy_coef=ALG_CONFIG["LEARN_ENTROPY_COEF"],
+            target_entropy=ALG_CONFIG["TARGET_ENTROPY"],
+            alpha=ALG_CONFIG["ALPHA"],
+            q_updates_per_policy_update=ALG_CONFIG["REDQ_Q_UPDATES_PER_POLICY_UPDATE"]
+        )
+    else:
+        # REDQSAC: N Q-networks with shared backbone
+        AGENT = partial(
+            SharedBackbone_Agent,
+            device='cuda' if cfg.CUDA_TRAINING else 'cpu',
+            model_cls=TRAIN_MODEL,
+            lr_actor=ALG_CONFIG["LR_ACTOR"],
+            lr_critic=ALG_CONFIG["LR_CRITIC"],
+            lr_entropy=ALG_CONFIG["LR_ENTROPY"],
+            gamma=ALG_CONFIG["GAMMA"],
+            polyak=ALG_CONFIG["POLYAK"],
+            learn_entropy_coef=ALG_CONFIG["LEARN_ENTROPY_COEF"],
+            target_entropy=ALG_CONFIG["TARGET_ENTROPY"],
+            alpha=ALG_CONFIG["ALPHA"],
+            n=ALG_CONFIG["REDQ_N"],
+            m=ALG_CONFIG["REDQ_M"],
+            q_updates_per_policy_update=ALG_CONFIG["REDQ_Q_UPDATES_PER_POLICY_UPDATE"]
+        )
+else:
+    AGENT = partial(
+        REDQ_Agent,
+        device='cuda' if cfg.CUDA_TRAINING else 'cpu',
+        model_cls=TRAIN_MODEL,
+        lr_actor=ALG_CONFIG["LR_ACTOR"],
+        lr_critic=ALG_CONFIG["LR_CRITIC"],
+        lr_entropy=ALG_CONFIG["LR_ENTROPY"],
+        gamma=ALG_CONFIG["GAMMA"],
+        polyak=ALG_CONFIG["POLYAK"],
+        learn_entropy_coef=ALG_CONFIG["LEARN_ENTROPY_COEF"],
+        target_entropy=ALG_CONFIG["TARGET_ENTROPY"],
+        alpha=ALG_CONFIG["ALPHA"],
+        n=ALG_CONFIG["REDQ_N"],
+        m=ALG_CONFIG["REDQ_M"],
+        q_updates_per_policy_update=ALG_CONFIG["REDQ_Q_UPDATES_PER_POLICY_UPDATE"]
+    )
+
+# TRAINER: =====================================================
+
+
+def sac_v2_entropy_scheduler(agent, epoch):
+    start_ent = -0.0
+    end_ent = -7.0
+    end_epoch = 200
+    if epoch <= end_epoch:
+        agent.entopy_target = start_ent + (end_ent - start_ent) * epoch / end_epoch
+
+
+ENV_CLS = partial(GenericGymEnv, id=cfg.RTGYM_VERSION, gym_kwargs={"config": CONFIG_DICT})
+
+if cfg.PRAGMA_LIDAR:  # lidar
+    TRAINER = partial(
+        TorchTrainingOffline,
+        env_cls=ENV_CLS,
+        memory_cls=MEMORY,
+        epochs=cfg.TMRL_CONFIG["MAX_EPOCHS"],
+        rounds=cfg.TMRL_CONFIG["ROUNDS_PER_EPOCH"],
+        steps=cfg.TMRL_CONFIG["TRAINING_STEPS_PER_ROUND"],
+        update_model_interval=cfg.TMRL_CONFIG["UPDATE_MODEL_INTERVAL"],
+        update_buffer_interval=cfg.TMRL_CONFIG["UPDATE_BUFFER_INTERVAL"],
+        max_training_steps_per_env_step=cfg.TMRL_CONFIG["MAX_TRAINING_STEPS_PER_ENVIRONMENT_STEP"],
+        profiling=cfg.PROFILE_TRAINER,
+        training_agent_cls=AGENT,
+        agent_scheduler=None,  # sac_v2_entropy_scheduler
+        start_training=cfg.TMRL_CONFIG["ENVIRONMENT_STEPS_BEFORE_TRAINING"])  # set this > 0 to start from an existing policy (fills the buffer up to this number of samples before starting training)
+else:  # images
+    TRAINER = partial(
+        TorchTrainingOffline,
+        env_cls=ENV_CLS,
+        memory_cls=MEMORY,
+        epochs=cfg.TMRL_CONFIG["MAX_EPOCHS"],
+        rounds=cfg.TMRL_CONFIG["ROUNDS_PER_EPOCH"],
+        steps=cfg.TMRL_CONFIG["TRAINING_STEPS_PER_ROUND"],
+        update_model_interval=cfg.TMRL_CONFIG["UPDATE_MODEL_INTERVAL"],
+        update_buffer_interval=cfg.TMRL_CONFIG["UPDATE_BUFFER_INTERVAL"],
+        max_training_steps_per_env_step=cfg.TMRL_CONFIG["MAX_TRAINING_STEPS_PER_ENVIRONMENT_STEP"],
+        profiling=cfg.PROFILE_TRAINER,
+        training_agent_cls=AGENT,
+        agent_scheduler=None,  # sac_v2_entropy_scheduler
+        start_training=cfg.TMRL_CONFIG["ENVIRONMENT_STEPS_BEFORE_TRAINING"])
+
+# CHECKPOINTS: ===================================================
+
+DUMP_RUN_INSTANCE_FN = None if cfg.PRAGMA_LIDAR else None  # dump_run_instance_images_dataset
+LOAD_RUN_INSTANCE_FN = None if cfg.PRAGMA_LIDAR else None  # load_run_instance_images_dataset
+UPDATER_FN = update_run_instance if ALG_NAME in ["SAC", "REDQSAC"] else None
