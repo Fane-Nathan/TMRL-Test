@@ -1,6 +1,9 @@
 # standard library imports
+import csv
+import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 # third-party imports
 import torch
@@ -67,6 +70,19 @@ class TrainingOffline:
                                              device=device)
         self.total_samples = len(self.memory)
         logging.info(f" Initial total_samples:{self.total_samples}")
+
+        # === CSV Logger for Ablation Study ===
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_header_written = False
+        self._training_start_time = time.time()
+        ablation_dir = Path(os.environ.get("TMRL_ABLATION_DIR", Path.home() / "TmrlData" / "ablation"))
+        ablation_dir.mkdir(parents=True, exist_ok=True)
+        run_name = os.environ.get("TMRL_RUN_NAME", "default")
+        csv_path = ablation_dir / f"{run_name}.csv"
+        self._csv_file = open(csv_path, "a", newline="")
+        self._csv_writer = csv.writer(self._csv_file)
+        logging.info(f" CSV logging to: {csv_path}")
 
     def update_buffer(self, interface):
         buffer = interface.retrieve_buffer()
@@ -153,6 +169,18 @@ class TrainingOffline:
             stats += pandas_dict(memory_len=len(self.memory), round_time=round_time, idle_time=idle_time, **DataFrame(stats_training).mean(skipna=True)),
 
             logging.info(stats[-1].add_prefix("  ").to_string() + '\n')
+
+            # === CSV: append round metrics ===
+            if self._csv_writer is not None:
+                row_data = stats[-1]
+                if not self._csv_header_written:
+                    header = ["wall_clock_seconds", "epoch", "round"] + list(row_data.index)
+                    self._csv_writer.writerow(header)
+                    self._csv_header_written = True
+                elapsed = time.time() - self._training_start_time
+                values = [f"{elapsed:.1f}", self.epoch, rnd] + [f"{v:.6f}" if isinstance(v, float) else str(v) for v in row_data.values]
+                self._csv_writer.writerow(values)
+                self._csv_file.flush()
 
             if self.profiling:
                 pro.stop()

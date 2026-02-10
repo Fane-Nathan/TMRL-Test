@@ -718,8 +718,8 @@ class DroQSACAgent(TrainingAgent):
         else:
             alpha_t = self.alpha_t
 
-        # Check if model supports FiLM context
-        uses_context = hasattr(self.model, 'context_encoder')
+        # Check if model supports FiLM context (None = Vanilla baseline)
+        uses_context = hasattr(self.model, 'context_encoder') and self.model.context_encoder is not None
 
         # === Target Q computation (with no_grad, dropout disabled) ===
         with torch.no_grad():

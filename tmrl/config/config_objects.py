@@ -12,6 +12,7 @@ from tmrl.custom.custom_memories import MemoryTMFull, MemoryTMLidar, MemoryTMLid
 from tmrl.custom.tm.tm_preprocessors import obs_preprocessor_tm_act_in_obs, obs_preprocessor_tm_lidar_act_in_obs, obs_preprocessor_tm_lidar_progress_act_in_obs, obs_preprocessor_tm_hybrid
 from tmrl.envs import GenericGymEnv
 from tmrl.custom.custom_models import SquashedGaussianMLPActor, MLPActorCritic, REDQMLPActorCritic, RNNActorCritic, SquashedGaussianRNNActor, SquashedGaussianVanillaCNNActor, VanillaCNNActorCritic, SquashedGaussianVanillaColorCNNActor, VanillaColorCNNActorCritic, HybridNanoEffNetActor, HybridNanoEffNetActorCritic, REDQHybridNanoEffNetActorCritic, SharedBackboneHybridActorCritic, SharedBackboneHybridActor, DroQHybridActorCritic, ContextualDroQHybridActorCritic, ContextualSharedBackboneHybridActor
+from ablation.model_variants import GRUOnlyDroQHybridActorCritic, GRUOnlySharedBackboneHybridActor, VanillaDroQHybridActorCritic, VanillaSharedBackboneHybridActor
 from tmrl.custom.custom_algorithms import SpinupSacAgent as SAC_Agent
 from tmrl.custom.custom_algorithms import REDQSACAgent as REDQ_Agent
 from tmrl.custom.custom_algorithms import SharedBackboneREDQSACAgent as SharedBackbone_Agent
@@ -48,8 +49,18 @@ if cfg.PRAGMA_LIDAR:
 elif PRAGMA_HYBRID:
     # === HYBRID CONFIGURATION ===
     if ALG_NAME == "DROQSAC":
-        TRAIN_MODEL = ContextualDroQHybridActorCritic  # DroQ + Context Encoder + Fusion Gate
-        POLICY = ContextualSharedBackboneHybridActor
+        # Ablation toggle: set TMRL_CONTEXT_MODE env var
+        import os
+        CONTEXT_MODE = os.environ.get("TMRL_CONTEXT_MODE", "everything")
+        if CONTEXT_MODE == "gru_only":
+            TRAIN_MODEL = GRUOnlyDroQHybridActorCritic
+            POLICY = GRUOnlySharedBackboneHybridActor
+        elif CONTEXT_MODE == "baseline":
+            TRAIN_MODEL = VanillaDroQHybridActorCritic
+            POLICY = VanillaSharedBackboneHybridActor
+        else:  # "everything" (default)
+            TRAIN_MODEL = ContextualDroQHybridActorCritic
+            POLICY = ContextualSharedBackboneHybridActor
     else:
         TRAIN_MODEL = SharedBackboneHybridActorCritic  # REDQSAC: N Q-networks with shared backbone
         POLICY = SharedBackboneHybridActor
