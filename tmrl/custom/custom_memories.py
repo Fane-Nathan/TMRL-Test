@@ -64,6 +64,27 @@ def get_local_buffer_sample_tm20_imgs(prev_act, obs, rew, terminated, truncated,
     return prev_act_mod, obs_mod, rew_mod, terminated_mod, truncated_mod, info_mod
 
 
+def get_local_buffer_sample_tm20_hybrid(prev_act, obs, rew, terminated, truncated, info):
+    """
+    Sample compressor for MemoryTMHybrid (CNN + Lidar)
+    Input:
+        prev_act: action computed from a previous observation
+        obs: (speed, gear, rpm, images, lidar, act1, act2) after preprocessing
+        rew, terminated, truncated, info: outcome of the transition
+    Compressed format: (speed, gear, rpm, image_single, lidar)
+    CAUTION: prev_act is the action that comes BEFORE obs
+    """
+    prev_act_mod = prev_act
+    # obs[3] = images (4 frames), we take only the last frame and convert to uint8
+    # obs[4] = lidar (19 floats)
+    obs_mod = (obs[0], obs[1], obs[2], (obs[3][-1] * 256.0).astype(np.uint8), obs[4])
+    rew_mod = rew
+    terminated_mod = terminated
+    truncated_mod = truncated
+    info_mod = info
+    return prev_act_mod, obs_mod, rew_mod, terminated_mod, truncated_mod, info_mod
+
+
 # FUNCTIONS ====================================================
 
 
@@ -574,5 +595,163 @@ class MemoryTMFull(MemoryTM):
             self.data[8] = self.data[8][to_trim:]
             self.data[9] = self.data[9][to_trim:]
             self.data[10] = self.data[10][to_trim:]
+
+        return self
+
+
+class MemoryTMHybrid(MemoryTM):
+    """
+    Memory class for TM2020 Hybrid (CNN + Lidar) observations.
+    Observation format: (speed, gear, rpm, images, lidar, act1, act2)
+    This stores all 7 components including lidar for the HybridNanoEffNet models.
+    """
+    def get_transition(self, item):
+        """
+        CAUTION: item is the first index of the 4 images in the images history of the OLD observation
+        CAUTION: in the buffer, a sample is (act, obs(act)) and NOT (obs, act(obs))
+        """
+        if self.data[4][item + self.min_samples - 1]:
+            if item == 0:
+                item += 1
+            elif item == self.__len__() - 1:
+                item -= 1
+            elif random.random() < 0.5:
+                item += 1
+            else:
+                item -= 1
+
+        idx_last = item + self.min_samples - 1
+        idx_now = item + self.min_samples
+
+        acts = self.load_acts(item)
+        last_act_buf = acts[:-1]
+        new_act_buf = acts[1:]
+
+        imgs = self.load_imgs(item)
+        imgs_last_obs = imgs[:-1]
+        imgs_new_obs = imgs[1:]
+
+        # Handle EOE (end-of-episode) transitions
+        last_eoes = self.data[4][idx_now - self.min_samples:idx_now]
+        last_eoe_idx = last_true_in_list(last_eoes)
+
+        assert last_eoe_idx is None or last_eoes[last_eoe_idx], f"last_eoe_idx:{last_eoe_idx}"
+
+        if last_eoe_idx is not None:
+            replace_hist_before_eoe(hist=new_act_buf, eoe_idx_in_hist=last_eoe_idx - self.start_acts_offset - 1)
+            replace_hist_before_eoe(hist=last_act_buf, eoe_idx_in_hist=last_eoe_idx - self.start_acts_offset)
+            replace_hist_before_eoe(hist=imgs_new_obs, eoe_idx_in_hist=last_eoe_idx - self.start_imgs_offset - 1)
+            replace_hist_before_eoe(hist=imgs_last_obs, eoe_idx_in_hist=last_eoe_idx - self.start_imgs_offset)
+
+        # Observation format: (speed, gear, rpm, images, lidar, act1, act2)
+        # data indices: 2=speed, 7=gear, 8=rpm, imgs from load_imgs, 11=lidar
+        last_obs = (self.data[2][idx_last], self.data[7][idx_last], self.data[8][idx_last], 
+                    imgs_last_obs, self.data[11][idx_last], *last_act_buf)
+        new_act = self.data[1][idx_now]
+        rew = np.float32(self.data[5][idx_now])
+        new_obs = (self.data[2][idx_now], self.data[7][idx_now], self.data[8][idx_now], 
+                   imgs_new_obs, self.data[11][idx_now], *new_act_buf)
+        terminated = self.data[9][idx_now]
+        truncated = self.data[10][idx_now]
+        info = self.data[6][idx_now]
+
+        # === Build context window for Context Encoder ===
+        # Context: K=16 recent transitions before idx_last
+        # Each step: speed(1) + lidar(19) + action(3) + reward(1) = 24
+        K = 16
+        context = np.zeros((K, 24), dtype=np.float32)
+        total_data_len = len(self.data[0])
+        for k in range(K):
+            ctx_idx = idx_last - K + k  # indices [idx_last-K, ..., idx_last-1]
+            if ctx_idx < 0 or ctx_idx >= total_data_len:
+                continue  # leave as zeros (padding)
+            # Check episode boundary: if there's an EOE between ctx_idx and idx_last, zero-pad
+            if self.data[4][ctx_idx]:
+                # This index is an EOE, zero out everything before it
+                for j in range(k):
+                    context[j] = 0.0
+                continue
+            # Use .reshape(-1)[-1] to handle both scalars and history sequences robustly
+            spd = np.float32(self.data[2][ctx_idx]).reshape(-1)[-1]
+            lid = np.array(self.data[11][ctx_idx], dtype=np.float32).flatten()
+            act_ctx = np.array(self.data[1][ctx_idx], dtype=np.float32).flatten()
+            rwrd = np.float32(self.data[5][ctx_idx]).reshape(-1)[-1]
+            context[k, 0] = spd
+            context[k, 1:20] = lid
+            context[k, 20:23] = act_ctx
+            context[k, 23] = rwrd
+
+        return last_obs, new_act, rew, new_obs, terminated, truncated, info, context
+
+    def load_imgs(self, item):
+        res = self.data[3][(item + self.start_imgs_offset):(item + self.start_imgs_offset + self.imgs_obs + 1)]
+        return np.stack(res).astype(np.float32) / 256.0
+
+    def load_acts(self, item):
+        res = self.data[1][(item + self.start_acts_offset):(item + self.start_acts_offset + self.act_buf_len + 1)]
+        return res
+
+    def append_buffer(self, buffer):
+        """
+        buffer is a list of samples (act, obs, rew, terminated, truncated, info)
+        obs format from worker: (speed, gear, rpm, images, lidar, act1, act2) after preprocessing
+        But in the compressed sample, obs is (speed, gear, rpm, image_single, lidar)
+        """
+        first_data_idx = self.data[0][-1] + 1 if self.__len__() > 0 else 0
+
+        d0 = [first_data_idx + i for i, _ in enumerate(buffer.memory)]  # indexes
+        d1 = [b[0] for b in buffer.memory]  # actions
+        d2 = [b[1][0] for b in buffer.memory]  # speeds
+        d3 = [b[1][3] for b in buffer.memory]  # images (single frame, compressed)
+        d4 = [b[3] or b[4] for b in buffer.memory]  # eoes
+        d5 = [b[2] for b in buffer.memory]  # rewards
+        d6 = [b[5] for b in buffer.memory]  # infos
+        d7 = [b[1][1] for b in buffer.memory]  # gears
+        d8 = [b[1][2] for b in buffer.memory]  # rpms
+        d9 = [b[3] for b in buffer.memory]  # terminated
+        d10 = [b[4] for b in buffer.memory]  # truncated
+        d11 = [b[1][4] if len(b[1]) > 4 else np.zeros(19, dtype=np.float32) for b in buffer.memory]  # lidar
+
+        if self.__len__() > 0:
+            self.data[0] += d0
+            self.data[1] += d1
+            self.data[2] += d2
+            self.data[3] += d3
+            self.data[4] += d4
+            self.data[5] += d5
+            self.data[6] += d6
+            self.data[7] += d7
+            self.data[8] += d8
+            self.data[9] += d9
+            self.data[10] += d10
+            self.data[11] += d11
+        else:
+            self.data.append(d0)
+            self.data.append(d1)
+            self.data.append(d2)
+            self.data.append(d3)
+            self.data.append(d4)
+            self.data.append(d5)
+            self.data.append(d6)
+            self.data.append(d7)
+            self.data.append(d8)
+            self.data.append(d9)
+            self.data.append(d10)
+            self.data.append(d11)
+
+        to_trim = self.__len__() - self.memory_size
+        if to_trim > 0:
+            self.data[0] = self.data[0][to_trim:]
+            self.data[1] = self.data[1][to_trim:]
+            self.data[2] = self.data[2][to_trim:]
+            self.data[3] = self.data[3][to_trim:]
+            self.data[4] = self.data[4][to_trim:]
+            self.data[5] = self.data[5][to_trim:]
+            self.data[6] = self.data[6][to_trim:]
+            self.data[7] = self.data[7][to_trim:]
+            self.data[8] = self.data[8][to_trim:]
+            self.data[9] = self.data[9][to_trim:]
+            self.data[10] = self.data[10][to_trim:]
+            self.data[11] = self.data[11][to_trim:]
 
         return self

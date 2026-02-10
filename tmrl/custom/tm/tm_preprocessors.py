@@ -38,5 +38,22 @@ def obs_preprocessor_tm_lidar_progress_act_in_obs(obs):
 # be careful whatever you do here is consistent, because consistency after this will NOT be checked by CRC
 
 
+
 def sample_preprocessor_tm_lidar_act_in_obs(last_obs, act, rew, new_obs, terminated, truncated):
     return last_obs, act, rew, new_obs, terminated, truncated
+
+
+def obs_preprocessor_tm_hybrid(obs):
+    """
+    Preprocessor for TM2020 Hybrid (CNN + Lidar)
+    Input: (speed, gear, rpm, images, lidar, act1, act2)
+    """
+    speed, gear, rpm, images, lidar, act1, act2 = obs
+
+    # Normalize images (0-255 -> 0.0-1.0) for the CNN
+    images = images.astype(np.float32) / 255.0
+
+    # Ensure lidar is flat
+    lidar = np.ndarray.flatten(lidar)
+
+    return (speed, gear, rpm, images, lidar, act1, act2)

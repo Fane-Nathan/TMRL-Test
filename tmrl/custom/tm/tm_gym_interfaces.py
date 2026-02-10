@@ -353,5 +353,104 @@ class TM2020InterfaceLidarProgress(TM2020InterfaceLidar):
         return spaces.Tuple((speed, progress, imgs))
 
 
+
+class TM2020InterfaceHybrid(TM2020Interface):
+    """
+    Hybrid Interface: Returns (Speed, Gear, RPM, Images, LIDAR)
+    """
+    def __init__(self, img_hist_len=4, gamepad=False, save_replays=False, grayscale=True, resize_to=(64, 64)):
+        super().__init__(img_hist_len, gamepad, save_replays, grayscale, resize_to)
+        self.lidar = None
+
+    def initialize(self):
+        super().initialize()
+        # Initialize Lidar tool with a dummy screenshot
+        self.lidar = Lidar(self.window_interface.screenshot())
+
+    def grab_data_and_img_and_lidar(self):
+        # 1. Capture RAW screenshot (needed for accurate LIDAR)
+        img_raw = self.window_interface.screenshot()[:, :, :3] # BGR
+
+        # 2. Compute Lidar from RAW image
+        lidar = self.lidar.lidar_20(img=img_raw, show=False)
+
+        # 3. Process Image for CNN (Resize & Grayscale)
+        if self.resize_to is not None:
+            img = cv2.resize(img_raw, self.resize_to)
+        else:
+            img = img_raw
+
+        if self.grayscale:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            img = img[:, :, ::-1] # RGB
+
+        data = self.client.retrieve_data()
+        self.img = img # For render
+
+        return data, img, lidar
+
+    def reset(self, seed=None, options=None):
+        self.reset_common()
+        data, img, lidar = self.grab_data_and_img_and_lidar()
+
+        speed = np.array([data[0]], dtype='float32')
+        gear = np.array([data[9]], dtype='float32')
+        rpm = np.array([data[10]], dtype='float32')
+
+        self.img_hist.clear()
+        for _ in range(self.img_hist_len):
+            self.img_hist.append(img)
+        imgs = np.array(list(self.img_hist))
+
+        # Obs structure matches the HybridNanoEffNet expectation:
+        # (speed, gear, rpm, images, lidar)
+        obs = [speed, gear, rpm, imgs, lidar]
+        self.reward_function.reset()
+        return obs, {}
+
+    def get_obs_rew_terminated_info(self):
+        data, img, lidar = self.grab_data_and_img_and_lidar()
+
+        speed = np.array([data[0]], dtype='float32')
+        gear = np.array([data[9]], dtype='float32')
+        rpm = np.array([data[10]], dtype='float32')
+
+        rew, terminated = self.reward_function.compute_reward(pos=np.array([data[2], data[3], data[4]]))
+
+        self.img_hist.append(img)
+        imgs = np.array(list(self.img_hist))
+
+        obs = [speed, gear, rpm, imgs, lidar]
+
+        end_of_track = bool(data[8])
+        info = {}
+        if end_of_track:
+            terminated = True
+            rew += self.finish_reward
+        rew += self.constant_penalty
+        rew = np.float32(rew)
+        return obs, rew, terminated, info
+
+    def get_observation_space(self):
+        speed = spaces.Box(low=0.0, high=1000.0, shape=(1, ))
+        gear = spaces.Box(low=0.0, high=6, shape=(1, ))
+        rpm = spaces.Box(low=0.0, high=np.inf, shape=(1, ))
+
+        if self.resize_to is not None:
+            w, h = self.resize_to
+        else:
+            w, h = cfg.WINDOW_HEIGHT, cfg.WINDOW_WIDTH
+
+        if self.grayscale:
+            img_space = spaces.Box(low=0.0, high=255.0, shape=(self.img_hist_len, h, w))
+        else:
+            img_space = spaces.Box(low=0.0, high=255.0, shape=(self.img_hist_len, h, w, 3))
+
+        lidar_space = spaces.Box(low=0.0, high=np.inf, shape=(19,))
+
+        return spaces.Tuple((speed, gear, rpm, img_space, lidar_space))
+
+
 if __name__ == "__main__":
     pass

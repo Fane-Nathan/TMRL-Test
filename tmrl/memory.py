@@ -162,7 +162,13 @@ class Memory(ABC):
             self.append_buffer(buffer)
 
     def __getitem__(self, item):
-        prev_obs, new_act, rew, new_obs, terminated, truncated, info = self.get_transition(item)
+        transition = self.get_transition(item)
+        # Support context-augmented memories (8 values) and standard (7 values)
+        if len(transition) == 8:
+            prev_obs, new_act, rew, new_obs, terminated, truncated, info, context = transition
+        else:
+            prev_obs, new_act, rew, new_obs, terminated, truncated, info = transition
+            context = None
         if self.crc_debug:
             po, a, o, r, d, t = info['crc_sample']
             debug_ts, debug_ts_res = info['crc_sample_ts']
@@ -171,6 +177,8 @@ class Memory(ABC):
             prev_obs, new_act, rew, new_obs, terminated, truncated = self.sample_preprocessor(prev_obs, new_act, rew, new_obs, terminated, truncated)
         terminated = np.float32(terminated)  # we don't want bool tensors
         truncated = np.float32(truncated)  # we don't want bool tensors
+        if context is not None:
+            return prev_obs, new_act, rew, new_obs, terminated, truncated, context
         return prev_obs, new_act, rew, new_obs, terminated, truncated
 
     def sample_indices(self):

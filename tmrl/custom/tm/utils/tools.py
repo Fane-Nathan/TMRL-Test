@@ -103,7 +103,9 @@ class Lidar:
         h, w, _ = im.shape
         self.h = h
         self.w = w
-        self.road_point = (44*h//49, w//2)
+        # Calibrated Lidar Origin (User-Specific)
+        # Ratio ~0.617 (Y=79 for H=128)
+        self.road_point = (int(h * 0.598), w//2)
         min_dist = 20
         list_ax_x = []
         list_ax_y = []

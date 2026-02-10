@@ -6,6 +6,7 @@ from dataclasses import dataclass
 # third-party imports
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.optim import Adam, AdamW, SGD
 
 # local imports
@@ -347,6 +348,8 @@ class REDQSACAgent(TrainingAgent):
 
         self.i_update += 1
         update_policy = (self.i_update % self.q_updates_per_policy_update == 0)
+        # DEBUG: Confirm new code is running
+        # print(f"DEBUG: Train Step {self.i_update}, Update Policy: {update_policy}, Learn Ent: {self.learn_entropy_coef}")
 
         o, a, r, o2, d, _ = batch
 
@@ -355,9 +358,10 @@ class REDQSACAgent(TrainingAgent):
         # FIXME? log_prob = log_prob.reshape(-1, 1)
 
         loss_alpha = None
-        if self.learn_entropy_coef and update_policy:
+        if self.learn_entropy_coef:
             alpha_t = torch.exp(self.log_alpha.detach())
-            loss_alpha = -(self.log_alpha * (logp_pi + self.target_entropy).detach()).mean()
+            if update_policy:
+                loss_alpha = -(self.log_alpha * (logp_pi + self.target_entropy).detach()).mean()
         else:
             alpha_t = self.alpha_t
 
@@ -419,6 +423,409 @@ class REDQSACAgent(TrainingAgent):
         )
 
         if self.learn_entropy_coef:
+            ret_dict["loss_entropy_coef"] = loss_alpha.detach().item()
+            ret_dict["entropy_coef"] = alpha_t.item()
+
+        return ret_dict
+
+
+# ========== SHARED BACKBONE REDQ-SAC AGENT ==========
+# Optimized for 4GB VRAM: Uses shared CNN backbone across actor + critics
+
+
+@dataclass(eq=0)
+class SharedBackboneREDQSACAgent(TrainingAgent):
+    """
+    REDQ-SAC Agent optimized for low VRAM GPUs.
+    
+    Uses SharedBackboneHybridActorCritic which shares ONE CNN across all networks.
+    Key optimization: Features are extracted ONCE and reused for all Q-heads.
+    """
+    observation_space: type
+    action_space: type
+    device: str = None
+    model_cls: type = core.SharedBackboneHybridActorCritic
+    gamma: float = 0.99
+    polyak: float = 0.995
+    alpha: float = 0.2
+    lr_actor: float = 1e-3
+    lr_critic: float = 1e-3
+    lr_entropy: float = 1e-3
+    learn_entropy_coef: bool = True
+    target_entropy: float = None
+    n: int = 2  # number of Q networks (default 2 for VRAM)
+    m: int = 2  # number of randomly sampled target networks
+    q_updates_per_policy_update: int = 1
+
+    model_nograd = cached_property(lambda self: no_grad(copy_shared(self.model)))
+
+    def __post_init__(self):
+        observation_space, action_space = self.observation_space, self.action_space
+        device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        model = self.model_cls(observation_space, action_space, n=self.n)
+        logging.debug(f" device SharedBackbone-REDQ-SAC: {device}")
+        self.model = model.to(device)
+        self.model_target = no_grad(deepcopy(self.model))
+        
+        # Optimizer for actor's policy head only (features are fixed/detached for actor)
+        self.pi_optimizer = Adam(
+            list(self.model.actor.net.parameters()) +
+            list(self.model.actor.mu_layer.parameters()) +
+            list(self.model.actor.log_std_layer.parameters()), 
+            lr=self.lr_actor
+        )
+        
+        # Optimizer for Q-heads AND Encoder (Critic drives representation)
+        q_params = [p for q in self.model.qs for p in q.parameters()]
+        encoder_params = list(self.model.actor.cnn.parameters()) + list(self.model.actor.float_mlp.parameters())
+        if hasattr(self.model.actor, "fusion_norm"):
+            encoder_params += list(self.model.actor.fusion_norm.parameters())
+        if hasattr(self.model.actor, "fusion_gate"):
+            encoder_params += list(self.model.actor.fusion_gate.parameters())
+        if hasattr(self.model.actor, "context_encoder"):
+            encoder_params += list(self.model.actor.context_encoder.parameters())
+        if hasattr(self.model.actor, "film_generator"):
+            encoder_params += list(self.model.actor.film_generator.parameters())
+
+        self.q_optimizer = Adam(q_params + encoder_params, lr=self.lr_critic)
+        
+        self.criterion = torch.nn.MSELoss()
+        self.loss_pi = torch.zeros((1,), device=device)
+        self.loss_q = torch.zeros((1,), device=device)  # Initialize loss_q
+        self.i_update = 0
+
+        if self.target_entropy is None:
+            self.target_entropy = -np.prod(action_space.shape)
+        else:
+            self.target_entropy = float(self.target_entropy)
+
+        if self.learn_entropy_coef:
+            self.log_alpha = torch.log(torch.ones(1, device=self.device) * self.alpha).requires_grad_(True)
+            self.alpha_optimizer = Adam([self.log_alpha], lr=self.lr_entropy)
+        else:
+            self.alpha_t = torch.tensor(float(self.alpha)).to(self.device)
+
+    def get_actor(self):
+        return self.model_nograd.actor
+
+    def train(self, batch):
+        self.i_update += 1
+        update_policy = (self.i_update % self.q_updates_per_policy_update == 0)
+
+        o, a, r, o2, d, _ = batch
+
+        # Get current alpha
+        if self.learn_entropy_coef:
+            alpha_t = torch.exp(self.log_alpha.detach())
+        else:
+            alpha_t = self.alpha_t
+
+        # === Target Q computation (with no_grad) ===
+        with torch.no_grad():
+            # Extract features for next obs from TARGET network
+            features_o2_target = self.model_target.forward_features(o2)
+            a2, logp_a2 = self.model_target.actor_from_features(features_o2_target)
+
+            sample_idxs = np.random.choice(self.n, self.m, replace=False)
+            q_prediction_next_list = [self.model_target.qs[i](features_o2_target, a2) for i in sample_idxs]
+            q_prediction_next_cat = torch.stack(q_prediction_next_list, -1)
+            min_q, _ = torch.min(q_prediction_next_cat, dim=1, keepdim=True)
+            backup = r.unsqueeze(dim=-1) + self.gamma * (1 - d.unsqueeze(dim=-1)) * (min_q - alpha_t * logp_a2.unsqueeze(dim=-1))
+
+        # === Critic update ===
+        # Extract features for current obs (WITH gradients for encoder from critics)
+        features_o_critic = self.model.forward_features(o)
+        
+        q_prediction_list = [q(features_o_critic, a) for q in self.model.qs]
+        q_prediction_cat = torch.stack(q_prediction_list, -1)
+        backup = backup.expand((-1, self.n)) if backup.shape[1] == 1 else backup
+
+        loss_q = self.criterion(q_prediction_cat, backup)
+        self.loss_q = loss_q.detach()
+
+        self.q_optimizer.zero_grad()
+        loss_q.backward()
+        self.q_optimizer.step()
+
+        # === Actor update (includes encoder gradients) ===
+        loss_alpha = None
+        if update_policy:
+            for q in self.model.qs:
+                q.requires_grad_(False)
+
+            # Extract features DETACHED for actor (Actor doesn't update encoder)
+            with torch.no_grad():
+                features_o_actor = self.model.forward_features(o)
+            pi, logp_pi = self.model.actor_from_features(features_o_actor)
+            
+            qs_pi = [q(features_o_actor, pi) for q in self.model.qs]
+            qs_pi_cat = torch.stack(qs_pi, -1)
+            ave_q = torch.mean(qs_pi_cat, dim=1, keepdim=True)
+            loss_pi = (alpha_t * logp_pi.unsqueeze(dim=-1) - ave_q).mean()
+            
+            self.pi_optimizer.zero_grad()
+            loss_pi.backward()
+            self.pi_optimizer.step()
+
+            for q in self.model.qs:
+                q.requires_grad_(True)
+
+            # Entropy coefficient update (after actor update)
+            if self.learn_entropy_coef:
+                # Need fresh logp_pi for alpha gradient
+                with torch.no_grad():
+                    features_alpha = self.model.forward_features(o)
+                _, logp_pi_alpha = self.model.actor_from_features(features_alpha)
+                loss_alpha = -(self.log_alpha * (logp_pi_alpha + self.target_entropy).detach()).mean()
+                self.alpha_optimizer.zero_grad()
+                loss_alpha.backward()
+                self.alpha_optimizer.step()
+
+            self.loss_pi = loss_pi.detach()
+
+        # === Polyak averaging ===
+        with torch.no_grad():
+            for p, p_targ in zip(self.model.parameters(), self.model_target.parameters()):
+                p_targ.data.mul_(self.polyak)
+                p_targ.data.add_((1 - self.polyak) * p.data)
+
+        ret_dict = dict(
+            loss_actor=self.loss_pi.detach().item(),
+            loss_critic=self.loss_q.detach().item(),
+        )
+
+        if self.learn_entropy_coef and loss_alpha is not None:
+            ret_dict["loss_entropy_coef"] = loss_alpha.detach().item()
+            ret_dict["entropy_coef"] = alpha_t.item()
+
+        return ret_dict
+
+
+# ============== DroQ SAC Agent ==============
+
+class DroQSACAgent(TrainingAgent):
+    """
+    DroQ (Dropout Q-functions) SAC Agent for maximum sample efficiency.
+    
+    Key features:
+    - Uses only 2 Q-networks with Dropout+LayerNorm
+    - Supports high UTD (Update-to-Data) ratios (20+)
+    - Dropout provides ensemble-like diversity for uncertainty
+    - Compatible with shared backbone architecture
+    """
+    model_nograd = cached_property(lambda self: no_grad(copy_shared(self.model)))
+
+    def __init__(self,
+                 observation_space,
+                 action_space,
+                 device,
+                 model_cls=core.DroQHybridActorCritic,
+                 gamma=0.99,
+                 polyak=0.995,
+                 alpha=0.2,
+                 lr_actor=1e-3,
+                 lr_critic=1e-3,
+                 lr_entropy=1e-3,
+                 learn_entropy_coef=True,
+                 target_entropy=None,
+                 q_updates_per_policy_update=20,
+                 model=None):
+        super().__init__(observation_space=observation_space,
+                         action_space=action_space,
+                         device=device)
+        self.gamma = gamma
+        self.polyak = polyak
+        self.alpha = alpha
+        self.lr_actor = lr_actor
+        self.lr_critic = lr_critic
+        self.lr_entropy = lr_entropy
+        self.learn_entropy_coef = learn_entropy_coef
+        self.target_entropy = target_entropy
+        self.n = 2  # DroQ always uses 2 Q-networks
+        self.m = 2  # Use both for min-Q
+        self.q_updates_per_policy_update = q_updates_per_policy_update
+
+        model = model if model is not None else model_cls(observation_space, action_space)
+        self.model = model.to(device)
+        self.model_target = no_grad(deepcopy(self.model))
+        
+        # Optimizer for actor's policy head only (features are fixed/detached for actor)
+        self.pi_optimizer = Adam(
+            list(self.model.actor.net.parameters()) +
+            list(self.model.actor.mu_layer.parameters()) +
+            list(self.model.actor.log_std_layer.parameters()), 
+            lr=self.lr_actor
+        )
+        
+        # Optimizer for Q-heads AND Encoder (Critic drives representation)
+        q_params = [p for q in self.model.qs for p in q.parameters()]
+        encoder_params = list(self.model.actor.cnn.parameters()) + list(self.model.actor.float_mlp.parameters())
+        if hasattr(self.model.actor, "fusion_norm"):
+            encoder_params += list(self.model.actor.fusion_norm.parameters())
+        if hasattr(self.model.actor, "fusion_gate"):
+            encoder_params += list(self.model.actor.fusion_gate.parameters())
+        if hasattr(self.model.actor, "context_encoder"):
+            encoder_params += list(self.model.actor.context_encoder.parameters())
+
+        self.q_optimizer = Adam(q_params + encoder_params, lr=self.lr_critic)
+        
+        self.criterion = torch.nn.MSELoss()
+        self.loss_pi = torch.zeros((1,), device=device)
+        self.loss_q = torch.zeros((1,), device=device)
+        self.i_update = 0
+
+        if self.target_entropy is None:
+            self.target_entropy = -np.prod(action_space.shape)
+        else:
+            self.target_entropy = float(self.target_entropy)
+
+        if self.learn_entropy_coef:
+            self.log_alpha = torch.log(torch.ones(1, device=self.device) * self.alpha).requires_grad_(True)
+            self.alpha_optimizer = Adam([self.log_alpha], lr=self.lr_entropy)
+        else:
+            self.alpha_t = torch.tensor(float(self.alpha)).to(self.device)
+
+    def get_actor(self):
+        return self.model_nograd.actor
+
+    def train(self, batch):
+        """
+        DroQ training step.
+        Same as SharedBackboneREDQSAC but with dropout enabled during training.
+        Supports context-augmented batches for context-based meta-learning.
+        """
+        # Backward compatibility for checkpoints (init logic bypassed)
+        if not hasattr(self, "q_updates_per_policy_update"):
+             self.q_updates_per_policy_update = cfg.TMRL_CONFIG["ALG"]["REDQ_Q_UPDATES_PER_POLICY_UPDATE"]
+
+        self.i_update += 1
+        # DroQ uses high UTD ratio
+        update_policy = (self.i_update % self.q_updates_per_policy_update == 0)
+
+        # Unpack batch - support context-augmented (7 elements) and standard (6 elements)
+        if len(batch) == 7:
+            o, a, r, o2, d, _, ctx = batch
+        else:
+            o, a, r, o2, d, _ = batch
+            ctx = None
+
+        # Ensure Q-networks are in training mode (dropout active)
+        self.model.train()
+
+        # Get current alpha
+        if self.learn_entropy_coef:
+            alpha_t = torch.exp(self.log_alpha.detach())
+        else:
+            alpha_t = self.alpha_t
+
+        # Check if model supports FiLM context
+        uses_context = hasattr(self.model, 'context_encoder')
+
+        # === Target Q computation (with no_grad, dropout disabled) ===
+        with torch.no_grad():
+            self.model_target.eval()  # Disable dropout for target
+            if uses_context and ctx is not None:
+                fused_o2_tgt, film_o2_tgt, _ = self.model_target.forward_features(o2, ctx)
+            else:
+                fused_o2_tgt, film_o2_tgt, _ = self.model_target.forward_features(o2)
+            a2, logp_a2 = self.model_target.actor_from_features(fused_o2_tgt, film_o2_tgt)
+
+            # Use both Q-networks for min-Q
+            q_prediction_next_list = [q(fused_o2_tgt, a2, film_o2_tgt) for q in self.model_target.qs]
+            q_prediction_next_cat = torch.stack(q_prediction_next_list, -1)
+            min_q, _ = torch.min(q_prediction_next_cat, dim=1, keepdim=True)
+            backup = r.unsqueeze(dim=-1) + self.gamma * (1 - d.unsqueeze(dim=-1)) * (min_q - alpha_t * logp_a2.unsqueeze(dim=-1))
+
+        # === Critic update (with dropout) ===
+        self.model.train()  # Ensure dropout is active
+        if uses_context and ctx is not None:
+            fused_o_critic, film_o_critic, z_critic = self.model.forward_features(o, ctx)
+        else:
+            fused_o_critic, film_o_critic, z_critic = self.model.forward_features(o)
+        
+        q_prediction_list = [q(fused_o_critic, a, film_o_critic) for q in self.model.qs]
+        q_prediction_cat = torch.stack(q_prediction_list, -1)
+        backup = backup.expand((-1, self.n)) if backup.shape[1] == 1 else backup
+
+        loss_q = self.criterion(q_prediction_cat, backup)
+
+        # === Auxiliary multi-step reward prediction loss ===
+        loss_aux = torch.zeros(1, device=loss_q.device)
+        if uses_context and ctx is not None:
+            predicted_rewards = self.model.context_encoder.predict_reward(z_critic)  # list of (B,)
+            horizons = self.model.context_encoder.REWARD_HORIZONS  # [1, 3, 5]
+            K = ctx.shape[1]  # context window length
+            aux_losses = []
+            for pred, h in zip(predicted_rewards, horizons):
+                target_idx = K - h  # index from end of context window
+                if target_idx >= 0:
+                    target_reward = ctx[:, target_idx, 23]  # reward is at dim 23
+                    aux_losses.append(F.mse_loss(pred, target_reward))
+            if aux_losses:
+                loss_aux = torch.stack(aux_losses).mean()
+                loss_q = loss_q + 0.5 * loss_aux  # weighted auxiliary loss
+
+        self.loss_q = loss_q.detach()
+
+        self.q_optimizer.zero_grad()
+        loss_q.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.q_optimizer.step()
+
+        # === Actor update ===
+        loss_alpha = None
+        if update_policy:
+            for q in self.model.qs:
+                q.requires_grad_(False)
+
+            with torch.no_grad():
+                if uses_context and ctx is not None:
+                    fused_o_actor, film_o_actor, _ = self.model.forward_features(o, ctx)
+                else:
+                    fused_o_actor, film_o_actor, _ = self.model.forward_features(o)
+            pi, logp_pi = self.model.actor_from_features(fused_o_actor, film_o_actor)
+            
+            qs_pi = [q(fused_o_actor, pi, film_o_actor) for q in self.model.qs]
+            qs_pi_cat = torch.stack(qs_pi, -1)
+            min_q_pi = torch.min(qs_pi_cat, dim=1, keepdim=True)[0]
+            loss_pi = (alpha_t * logp_pi.unsqueeze(dim=-1) - min_q_pi).mean()
+            
+            self.pi_optimizer.zero_grad()
+            loss_pi.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.pi_optimizer.step()
+
+            for q in self.model.qs:
+                q.requires_grad_(True)
+
+            # Entropy coefficient update
+            if self.learn_entropy_coef:
+                with torch.no_grad():
+                    if uses_context and ctx is not None:
+                        fused_alpha, film_alpha, _ = self.model.forward_features(o, ctx)
+                    else:
+                        fused_alpha, film_alpha, _ = self.model.forward_features(o)
+                _, logp_pi_alpha = self.model.actor_from_features(fused_alpha, film_alpha)
+                loss_alpha = -(self.log_alpha * (logp_pi_alpha + self.target_entropy).detach()).mean()
+                self.alpha_optimizer.zero_grad()
+                loss_alpha.backward()
+                torch.nn.utils.clip_grad_norm_(self.log_alpha, 1.0)
+                self.alpha_optimizer.step()
+
+            self.loss_pi = loss_pi.detach()
+
+        # === Polyak averaging ===
+        with torch.no_grad():
+            for p, p_targ in zip(self.model.parameters(), self.model_target.parameters()):
+                p_targ.data.mul_(self.polyak)
+                p_targ.data.add_((1 - self.polyak) * p.data)
+
+        ret_dict = dict(
+            loss_actor=self.loss_pi.detach().item(),
+            loss_critic=self.loss_q.detach().item(),
+        )
+
+        if self.learn_entropy_coef and loss_alpha is not None:
             ret_dict["loss_entropy_coef"] = loss_alpha.detach().item()
             ret_dict["entropy_coef"] = alpha_t.item()
 

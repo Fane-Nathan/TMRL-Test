@@ -7,23 +7,35 @@ import rtgym
 # local imports
 import tmrl.config.config_constants as cfg
 from tmrl.training_offline import TorchTrainingOffline
-from tmrl.custom.tm.tm_gym_interfaces import TM2020Interface, TM2020InterfaceLidar, TM2020InterfaceLidarProgress
-from tmrl.custom.custom_memories import MemoryTMFull, MemoryTMLidar, MemoryTMLidarProgress, get_local_buffer_sample_lidar, get_local_buffer_sample_lidar_progress, get_local_buffer_sample_tm20_imgs
-from tmrl.custom.tm.tm_preprocessors import obs_preprocessor_tm_act_in_obs, obs_preprocessor_tm_lidar_act_in_obs, obs_preprocessor_tm_lidar_progress_act_in_obs
+from tmrl.custom.tm.tm_gym_interfaces import TM2020Interface, TM2020InterfaceLidar, TM2020InterfaceLidarProgress, TM2020InterfaceHybrid
+from tmrl.custom.custom_memories import MemoryTMFull, MemoryTMLidar, MemoryTMLidarProgress, MemoryTMHybrid, get_local_buffer_sample_lidar, get_local_buffer_sample_lidar_progress, get_local_buffer_sample_tm20_imgs, get_local_buffer_sample_tm20_hybrid
+from tmrl.custom.tm.tm_preprocessors import obs_preprocessor_tm_act_in_obs, obs_preprocessor_tm_lidar_act_in_obs, obs_preprocessor_tm_lidar_progress_act_in_obs, obs_preprocessor_tm_hybrid
 from tmrl.envs import GenericGymEnv
-from tmrl.custom.custom_models import SquashedGaussianMLPActor, MLPActorCritic, REDQMLPActorCritic, RNNActorCritic, SquashedGaussianRNNActor, SquashedGaussianVanillaCNNActor, VanillaCNNActorCritic, SquashedGaussianVanillaColorCNNActor, VanillaColorCNNActorCritic
+from tmrl.custom.custom_models import SquashedGaussianMLPActor, MLPActorCritic, REDQMLPActorCritic, RNNActorCritic, SquashedGaussianRNNActor, SquashedGaussianVanillaCNNActor, VanillaCNNActorCritic, SquashedGaussianVanillaColorCNNActor, VanillaColorCNNActorCritic, HybridNanoEffNetActor, HybridNanoEffNetActorCritic, REDQHybridNanoEffNetActorCritic, SharedBackboneHybridActorCritic, SharedBackboneHybridActor, DroQHybridActorCritic, ContextualDroQHybridActorCritic, ContextualSharedBackboneHybridActor
 from tmrl.custom.custom_algorithms import SpinupSacAgent as SAC_Agent
 from tmrl.custom.custom_algorithms import REDQSACAgent as REDQ_Agent
+from tmrl.custom.custom_algorithms import SharedBackboneREDQSACAgent as SharedBackbone_Agent
+from tmrl.custom.custom_algorithms import DroQSACAgent as DroQ_Agent
 from tmrl.custom.custom_checkpoints import update_run_instance
 from tmrl.util import partial
 
 
 ALG_CONFIG = cfg.TMRL_CONFIG["ALG"]
 ALG_NAME = ALG_CONFIG["ALGORITHM"]
-assert ALG_NAME in ["SAC", "REDQSAC"], f"If you wish to implement {ALG_NAME}, do not use 'ALG' in config.json for that."
+assert ALG_NAME in ["SAC", "REDQSAC", "DROQSAC"], f"If you wish to implement {ALG_NAME}, do not use 'ALG' in config.json for that."
 
 
 # MODEL, GYM ENVIRONMENT, REPLAY MEMORY AND TRAINING: ===========
+
+PRAGMA_HYBRID = False
+if "RTGYM_CONFIG" in cfg.ENV_CONFIG:
+    # RTGYM_INTERFACE is likely nested or we access it from cfg directly if available.
+    # config_constants.py usually loads config.json into TMRL_CONFIG.
+    # Let's assume cfg.ENV_CONFIG has the interface if we check config.json structure.
+    # In config.json: "ENV": { "RTGYM_INTERFACE": ... }
+    # In config_constants.py: ENV_CONFIG = TMRL_CONFIG["ENV"]
+    if "RTGYM_INTERFACE" in cfg.ENV_CONFIG:
+         PRAGMA_HYBRID = cfg.ENV_CONFIG["RTGYM_INTERFACE"] == "TM2020HYBRID"
 
 if cfg.PRAGMA_LIDAR:
     if cfg.PRAGMA_RNN:
@@ -33,17 +45,34 @@ if cfg.PRAGMA_LIDAR:
     else:
         TRAIN_MODEL = MLPActorCritic if ALG_NAME == "SAC" else REDQMLPActorCritic
         POLICY = SquashedGaussianMLPActor
+elif PRAGMA_HYBRID:
+    # === HYBRID CONFIGURATION ===
+    if ALG_NAME == "DROQSAC":
+        TRAIN_MODEL = ContextualDroQHybridActorCritic  # DroQ + Context Encoder + Fusion Gate
+        POLICY = ContextualSharedBackboneHybridActor
+    else:
+        TRAIN_MODEL = SharedBackboneHybridActorCritic  # REDQSAC: N Q-networks with shared backbone
+        POLICY = SharedBackboneHybridActor
 else:
     assert not cfg.PRAGMA_RNN, "RNNs not supported yet"
-    assert ALG_NAME == "SAC", f"{ALG_NAME} is not implemented here."
-    TRAIN_MODEL = VanillaCNNActorCritic if cfg.GRAYSCALE else VanillaColorCNNActorCritic
-    POLICY = SquashedGaussianVanillaCNNActor if cfg.GRAYSCALE else SquashedGaussianVanillaColorCNNActor
+    # Use HybridNanoEffNet for VRAM-efficient CNN with SE attention
+    if ALG_NAME == "SAC":
+        TRAIN_MODEL = HybridNanoEffNetActorCritic
+    else:  # REDQSAC
+        TRAIN_MODEL = REDQHybridNanoEffNetActorCritic
+    POLICY = HybridNanoEffNetActor
 
 if cfg.PRAGMA_LIDAR:
     if cfg.PRAGMA_PROGRESS:
         INT = partial(TM2020InterfaceLidarProgress, img_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD)
     else:
         INT = partial(TM2020InterfaceLidar, img_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD)
+elif PRAGMA_HYBRID:
+    INT = partial(TM2020InterfaceHybrid,
+                  img_hist_len=cfg.IMG_HIST_LEN,
+                  gamepad=cfg.PRAGMA_GAMEPAD,
+                  grayscale=cfg.GRAYSCALE,
+                  resize_to=(cfg.IMG_WIDTH, cfg.IMG_HEIGHT))
 else:
     INT = partial(TM2020Interface,
                   img_hist_len=cfg.IMG_HIST_LEN,
@@ -63,6 +92,8 @@ if cfg.PRAGMA_LIDAR:
         SAMPLE_COMPRESSOR = get_local_buffer_sample_lidar_progress
     else:
         SAMPLE_COMPRESSOR = get_local_buffer_sample_lidar
+elif PRAGMA_HYBRID:
+    SAMPLE_COMPRESSOR = get_local_buffer_sample_tm20_hybrid
 else:
     SAMPLE_COMPRESSOR = get_local_buffer_sample_tm20_imgs
 
@@ -72,6 +103,8 @@ if cfg.PRAGMA_LIDAR:
         OBS_PREPROCESSOR = obs_preprocessor_tm_lidar_progress_act_in_obs
     else:
         OBS_PREPROCESSOR = obs_preprocessor_tm_lidar_act_in_obs
+elif PRAGMA_HYBRID:
+    OBS_PREPROCESSOR = obs_preprocessor_tm_hybrid
 else:
     OBS_PREPROCESSOR = obs_preprocessor_tm_act_in_obs
 # to augment data that comes out of the replay buffer:
@@ -87,6 +120,8 @@ if cfg.PRAGMA_LIDAR:
             MEM = MemoryTMLidarProgress
         else:
             MEM = MemoryTMLidar
+elif PRAGMA_HYBRID:
+    MEM = MemoryTMHybrid
 else:
     MEM = MemoryTMFull
 
@@ -121,6 +156,42 @@ if ALG_NAME == "SAC":
         l2_actor=ALG_CONFIG["L2_ACTOR"] if "L2_ACTOR" in ALG_CONFIG else None,
         l2_critic=ALG_CONFIG["L2_CRITIC"] if "L2_CRITIC" in ALG_CONFIG else None
     )
+elif PRAGMA_HYBRID:
+    # Use appropriate agent for VRAM-optimized training
+    if ALG_NAME == "DROQSAC":
+        # DroQ: 2 Q-networks with Dropout+LayerNorm, high UTD
+        AGENT = partial(
+            DroQ_Agent,
+            device='cuda' if cfg.CUDA_TRAINING else 'cpu',
+            model_cls=TRAIN_MODEL,
+            lr_actor=ALG_CONFIG["LR_ACTOR"],
+            lr_critic=ALG_CONFIG["LR_CRITIC"],
+            lr_entropy=ALG_CONFIG["LR_ENTROPY"],
+            gamma=ALG_CONFIG["GAMMA"],
+            polyak=ALG_CONFIG["POLYAK"],
+            learn_entropy_coef=ALG_CONFIG["LEARN_ENTROPY_COEF"],
+            target_entropy=ALG_CONFIG["TARGET_ENTROPY"],
+            alpha=ALG_CONFIG["ALPHA"],
+            q_updates_per_policy_update=ALG_CONFIG["REDQ_Q_UPDATES_PER_POLICY_UPDATE"]
+        )
+    else:
+        # REDQSAC: N Q-networks with shared backbone
+        AGENT = partial(
+            SharedBackbone_Agent,
+            device='cuda' if cfg.CUDA_TRAINING else 'cpu',
+            model_cls=TRAIN_MODEL,
+            lr_actor=ALG_CONFIG["LR_ACTOR"],
+            lr_critic=ALG_CONFIG["LR_CRITIC"],
+            lr_entropy=ALG_CONFIG["LR_ENTROPY"],
+            gamma=ALG_CONFIG["GAMMA"],
+            polyak=ALG_CONFIG["POLYAK"],
+            learn_entropy_coef=ALG_CONFIG["LEARN_ENTROPY_COEF"],
+            target_entropy=ALG_CONFIG["TARGET_ENTROPY"],
+            alpha=ALG_CONFIG["ALPHA"],
+            n=ALG_CONFIG["REDQ_N"],
+            m=ALG_CONFIG["REDQ_M"],
+            q_updates_per_policy_update=ALG_CONFIG["REDQ_Q_UPDATES_PER_POLICY_UPDATE"]
+        )
 else:
     AGENT = partial(
         REDQ_Agent,
@@ -131,11 +202,11 @@ else:
         lr_entropy=ALG_CONFIG["LR_ENTROPY"],
         gamma=ALG_CONFIG["GAMMA"],
         polyak=ALG_CONFIG["POLYAK"],
-        learn_entropy_coef=ALG_CONFIG["LEARN_ENTROPY_COEF"],  # False for SAC v2 with no temperature autotuning
-        target_entropy=ALG_CONFIG["TARGET_ENTROPY"],  # None for automatic
-        alpha=ALG_CONFIG["ALPHA"],  # inverse of reward scale
-        n=ALG_CONFIG["REDQ_N"],  # number of Q networks
-        m=ALG_CONFIG["REDQ_M"],  # number of Q targets
+        learn_entropy_coef=ALG_CONFIG["LEARN_ENTROPY_COEF"],
+        target_entropy=ALG_CONFIG["TARGET_ENTROPY"],
+        alpha=ALG_CONFIG["ALPHA"],
+        n=ALG_CONFIG["REDQ_N"],
+        m=ALG_CONFIG["REDQ_M"],
         q_updates_per_policy_update=ALG_CONFIG["REDQ_Q_UPDATES_PER_POLICY_UPDATE"]
     )
 
