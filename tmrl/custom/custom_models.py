@@ -45,7 +45,7 @@ def count_vars(module):
 
 
 LOG_STD_MAX = 2
-LOG_STD_MIN = -2
+LOG_STD_MIN = -20.0
 EPSILON = 1e-7
 
 
