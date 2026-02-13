@@ -1,5 +1,6 @@
 # standard library imports
 import csv
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -10,12 +11,95 @@ import torch
 from pandas import DataFrame
 
 # local imports
+import tmrl.config.config_constants as cfg
 from tmrl.util import pandas_dict
 
 import logging
 
 
 __docformat__ = "google"
+
+
+def _ma_last(values, window=10):
+    if not values:
+        return 0.0
+    tail = values[-window:]
+    return float(sum(tail) / len(tail))
+
+
+def compute_stall_state(eval_returns,
+                        train_returns,
+                        best_eval_ma10=None,
+                        stall_epochs=0,
+                        improvement_threshold=0.05,
+                        patience=10):
+    """
+    Computes rolling anti-stall diagnostics from epoch-level eval/train returns.
+
+    Args:
+        eval_returns (List[float]): epoch-level evaluation returns.
+        train_returns (List[float]): epoch-level training returns.
+        best_eval_ma10 (float or None): best rolling eval MA10 observed so far.
+        stall_epochs (int): number of consecutive epochs without meaningful eval MA10 improvement.
+        improvement_threshold (float): relative improvement threshold (e.g. 0.05 = 5%).
+        patience (int): epochs without improvement before flagged as stalled.
+    """
+    eval_hist = []
+    train_hist = []
+    eval_ma10 = 0.0
+    train_ma10 = 0.0
+    best = best_eval_ma10
+    stall = int(stall_epochs)
+
+    for eval_ret, train_ret in zip(eval_returns, train_returns):
+        eval_hist.append(float(eval_ret))
+        train_hist.append(float(train_ret))
+        eval_ma10 = _ma_last(eval_hist, window=10)
+        train_ma10 = _ma_last(train_hist, window=10)
+
+        if best is None:
+            best = eval_ma10
+            stall = 0
+            continue
+
+        if best > 0.0:
+            improved = eval_ma10 >= best * (1.0 + improvement_threshold)
+        else:
+            improved = eval_ma10 > best + 1e-9
+
+        if improved:
+            best = eval_ma10
+            stall = 0
+        else:
+            stall += 1
+
+    return {
+        "eval_return_ma10": float(eval_ma10),
+        "train_return_ma10": float(train_ma10),
+        "best_eval_ma10": float(best if best is not None else 0.0),
+        "stall_epochs": int(stall),
+        "stalled": bool(stall >= patience),
+        "improvement_threshold": float(improvement_threshold),
+        "patience": int(patience),
+    }
+
+
+def compute_stall_dashboard(stall_state, warning_epochs=5):
+    """
+    Returns a compact dashboard state from stall metrics.
+    """
+    stall_epochs = int(stall_state.get("stall_epochs", 0))
+    patience = int(stall_state.get("patience", 10))
+    if stall_epochs >= patience:
+        status = "stalled"
+    elif stall_epochs >= warning_epochs:
+        status = "warning"
+    else:
+        status = "healthy"
+    return {
+        "status": status,
+        "warning_epochs": int(warning_epochs),
+    }
 
 
 @dataclass(eq=0)
@@ -72,17 +156,199 @@ class TrainingOffline:
         logging.info(f" Initial total_samples:{self.total_samples}")
 
         # === CSV Logger for Ablation Study ===
+        self._init_csv_logger()
+        self._ensure_stall_tracking_state()
+
+    def _resolve_run_name(self):
+        """Resolve run name from env override, then config.json, then fallback."""
+        env_name = os.environ.get("TMRL_RUN_NAME")
+        if env_name:
+            return env_name
+
+        config_file = Path.home() / "TmrlData" / "config" / "config.json"
+        if config_file.exists():
+            try:
+                import json
+                with open(config_file, encoding="utf-8") as f:
+                    config = json.load(f)
+                cfg_name = config.get("RUN_NAME")
+                if cfg_name:
+                    return cfg_name
+            except Exception:
+                pass
+        return "default"
+
+    def _init_csv_logger(self):
+        """Initialize CSV logger (called from __post_init__ and __setstate__)."""
         self._csv_file = None
         self._csv_writer = None
-        self._csv_header_written = False
         self._training_start_time = time.time()
         ablation_dir = Path(os.environ.get("TMRL_ABLATION_DIR", Path.home() / "TmrlData" / "ablation"))
         ablation_dir.mkdir(parents=True, exist_ok=True)
-        run_name = os.environ.get("TMRL_RUN_NAME", "default")
+        run_name = self._resolve_run_name()
         csv_path = ablation_dir / f"{run_name}.csv"
+        csv_has_content = csv_path.exists() and csv_path.stat().st_size > 0
         self._csv_file = open(csv_path, "a", newline="")
         self._csv_writer = csv.writer(self._csv_file)
+        self._csv_header_written = csv_has_content
+        self._csv_path = csv_path
+        self._stall_diag_path = ablation_dir / f"{run_name}_stall.json"
         logging.info(f" CSV logging to: {csv_path}")
+
+    def _ensure_stall_tracking_state(self):
+        # Backward-compatible defaults for older checkpoints.
+        if not hasattr(self, "_eval_epoch_returns"):
+            self._eval_epoch_returns = []
+        if not hasattr(self, "_train_epoch_returns"):
+            self._train_epoch_returns = []
+        if not hasattr(self, "_best_eval_ma10"):
+            self._best_eval_ma10 = None
+        if not hasattr(self, "_stall_epochs"):
+            self._stall_epochs = 0
+        if not hasattr(self, "_stall_improvement_threshold"):
+            self._stall_improvement_threshold = 0.05
+        if not hasattr(self, "_stall_patience"):
+            self._stall_patience = 10
+        if not hasattr(self, "_stall_warning_epochs"):
+            self._stall_warning_epochs = 5
+        if not hasattr(self, "_stall_last_auto_action"):
+            self._stall_last_auto_action = "none"
+        if not hasattr(self, "_stall_last_action_epoch"):
+            self._stall_last_action_epoch = -1
+
+    def _apply_auto_stall_recovery(self, stall_state):
+        """
+        Applies safe, bounded auto-recovery actions when stalled.
+        """
+        action_parts = []
+        if not stall_state.get("stalled", False):
+            self._stall_last_auto_action = "none"
+            return "none"
+
+        # Avoid repeated mutations in the same epoch.
+        if self._stall_last_action_epoch == self.epoch:
+            return self._stall_last_auto_action
+
+        # 1) Reduce UTD pressure when stalled.
+        if hasattr(self.agent, "q_updates_per_policy_update"):
+            old_utd = int(self.agent.q_updates_per_policy_update)
+            new_utd = max(8, old_utd - 2)
+            if new_utd != old_utd:
+                self.agent.q_updates_per_policy_update = new_utd
+                action_parts.append(f"utd:{old_utd}->{new_utd}")
+
+        # 2) Raise entropy floor slightly to recover exploration.
+        if hasattr(self.agent, "alpha_floor"):
+            old_floor = float(self.agent.alpha_floor)
+            new_floor = min(0.12, old_floor + 0.02)
+            if abs(new_floor - old_floor) > 1e-12:
+                self.agent.alpha_floor = new_floor
+                action_parts.append(f"alpha_floor:{old_floor:.3f}->{new_floor:.3f}")
+
+        action = ",".join(action_parts) if action_parts else "hold(stalled,no_change)"
+        self._stall_last_auto_action = action
+        self._stall_last_action_epoch = self.epoch
+        return action
+
+    def _update_stall_diagnostics(self, epoch_stats):
+        if not epoch_stats:
+            return
+
+        train_epoch_return = float(sum(float(s.get("return_train", 0.0)) for s in epoch_stats) / len(epoch_stats))
+        self._train_epoch_returns.append(train_epoch_return)
+
+        # If eval episodes are disabled, don't derive stall state from stale test stats.
+        eval_enabled = int(getattr(cfg, "TEST_EPISODE_INTERVAL", 0)) > 0
+        if not eval_enabled:
+            train_ma10 = _ma_last(self._train_epoch_returns, window=10)
+            self._stall_epochs = 0
+            self._stall_last_auto_action = "disabled(eval_off)"
+            payload = {
+                "epoch": int(self.epoch),
+                "eval_enabled": False,
+                "eval_epoch_return": None,
+                "train_epoch_return": train_epoch_return,
+                "eval_return_ma10": None,
+                "train_return_ma10": train_ma10,
+                "best_eval_ma10": None,
+                "stalled": False,
+                "stall_epochs": 0,
+                "improvement_threshold": self._stall_improvement_threshold,
+                "patience": self._stall_patience,
+                "status": "disabled",
+                "auto_action": self._stall_last_auto_action,
+                "updated_at_unix": time.time(),
+            }
+            with open(self._stall_diag_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+            logging.info(
+                f" Stall diagnostics: eval=disabled (TEST_EPISODE_INTERVAL=0), "
+                f"train_return_ma10={train_ma10:.6f}"
+            )
+            return
+
+        eval_epoch_return = float(sum(float(s.get("return_test", 0.0)) for s in epoch_stats) / len(epoch_stats))
+        self._eval_epoch_returns.append(eval_epoch_return)
+
+        state = compute_stall_state(
+            eval_returns=self._eval_epoch_returns,
+            train_returns=self._train_epoch_returns,
+            best_eval_ma10=None,
+            stall_epochs=0,
+            improvement_threshold=self._stall_improvement_threshold,
+            patience=self._stall_patience,
+        )
+        self._best_eval_ma10 = state["best_eval_ma10"]
+        self._stall_epochs = state["stall_epochs"]
+        dashboard = compute_stall_dashboard(state, warning_epochs=self._stall_warning_epochs)
+        auto_action = self._apply_auto_stall_recovery(state)
+
+        payload = {
+            "epoch": int(self.epoch),
+            "eval_epoch_return": eval_epoch_return,
+            "train_epoch_return": train_epoch_return,
+            "eval_return_ma10": state["eval_return_ma10"],
+            "train_return_ma10": state["train_return_ma10"],
+            "best_eval_ma10": state["best_eval_ma10"],
+            "stalled": state["stalled"],
+            "stall_epochs": state["stall_epochs"],
+            "improvement_threshold": state["improvement_threshold"],
+            "patience": state["patience"],
+            "status": dashboard["status"],
+            "auto_action": auto_action,
+            "updated_at_unix": time.time(),
+        }
+
+        with open(self._stall_diag_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+        logging.info(
+            f" Stall diagnostics: eval_return_ma10={state['eval_return_ma10']:.6f}, "
+            f"train_return_ma10={state['train_return_ma10']:.6f}, "
+            f"stalled={state['stalled']}, stall_epochs={state['stall_epochs']}"
+        )
+        logging.info(
+            f" Anti-stall dashboard: status={dashboard['status']}, "
+            f"auto_action={auto_action}, "
+            f"eval_ma10={state['eval_return_ma10']:.6f}, "
+            f"train_ma10={state['train_return_ma10']:.6f}, "
+            f"stall_epochs={state['stall_epochs']}/{state['patience']}"
+        )
+
+    def __getstate__(self):
+        """Exclude unpicklable CSV file handle from checkpoint."""
+        state = self.__dict__.copy()
+        state.pop('_csv_file', None)
+        state.pop('_csv_writer', None)
+        state.pop('_csv_header_written', None)
+        state.pop('_training_start_time', None)
+        return state
+
+    def __setstate__(self, state):
+        """Reinitialize CSV logger after loading checkpoint."""
+        self.__dict__.update(state)
+        self._init_csv_logger()
+        self._ensure_stall_tracking_state()
 
     def update_buffer(self, interface):
         buffer = interface.retrieve_buffer()
@@ -143,10 +409,22 @@ class TrainingOffline:
                 stats_training_dict = self.agent.train(batch)
 
                 t_train = time.time()
-
-                stats_training_dict["return_test"] = self.memory.stat_test_return
+                eval_enabled = int(getattr(cfg, "TEST_EPISODE_INTERVAL", 0)) > 0
+                if eval_enabled:
+                    stats_training_dict["return_test"] = self.memory.stat_test_return
+                    stats_training_dict["episode_length_test"] = self.memory.stat_test_steps
+                    stats_training_dict["return_test_det"] = getattr(self.memory, "stat_test_return_det", self.memory.stat_test_return)
+                    stats_training_dict["return_test_stoch"] = getattr(self.memory, "stat_test_return_stoch", self.memory.stat_test_return)
+                    stats_training_dict["episode_length_test_det"] = getattr(self.memory, "stat_test_steps_det", self.memory.stat_test_steps)
+                    stats_training_dict["episode_length_test_stoch"] = getattr(self.memory, "stat_test_steps_stoch", self.memory.stat_test_steps)
+                else:
+                    stats_training_dict["return_test"] = 0.0
+                    stats_training_dict["episode_length_test"] = 0.0
+                    stats_training_dict["return_test_det"] = 0.0
+                    stats_training_dict["return_test_stoch"] = 0.0
+                    stats_training_dict["episode_length_test_det"] = 0.0
+                    stats_training_dict["episode_length_test_stoch"] = 0.0
                 stats_training_dict["return_train"] = self.memory.stat_train_return
-                stats_training_dict["episode_length_test"] = self.memory.stat_test_steps
                 stats_training_dict["episode_length_train"] = self.memory.stat_train_steps
                 stats_training_dict["sampling_duration"] = t_sample - t_sample_prev
                 stats_training_dict["training_step_duration"] = t_train - t_update_buffer
@@ -171,7 +449,7 @@ class TrainingOffline:
             logging.info(stats[-1].add_prefix("  ").to_string() + '\n')
 
             # === CSV: append round metrics ===
-            if self._csv_writer is not None:
+            if getattr(self, '_csv_writer', None) is not None:
                 row_data = stats[-1]
                 if not self._csv_header_written:
                     header = ["wall_clock_seconds", "epoch", "round"] + list(row_data.index)
@@ -186,6 +464,8 @@ class TrainingOffline:
                 pro.stop()
                 logging.info(pro.output_text(unicode=True, color=False, show_all=True))
 
+        # Epoch-level anti-stall diagnostics.
+        self._update_stall_diagnostics(stats)
         self.epoch += 1
         return stats
 

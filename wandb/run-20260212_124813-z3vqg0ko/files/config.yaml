@@ -1,0 +1,84 @@
+_wandb:
+    value:
+        cli_version: 0.24.0
+        e:
+            3riyt0ah30tdbcnzz3lgk4zs2e0y9ik7:
+                args:
+                    - --test-mode
+                codePath: hyperparameter_sweep_optuna.py
+                codePathLocal: hyperparameter_sweep_optuna.py
+                cpu_count: 8
+                cpu_count_logical: 12
+                cudaVersion: "13.1"
+                disk:
+                    /:
+                        total: "1023099793408"
+                        used: "734237794304"
+                email: felnat.surjo@gmail.com
+                executable: C:\Users\felix\OneDrive\Documents\Data Mining\.venv\Scripts\python.exe
+                git:
+                    commit: 78c1121c54f014b040a48baad12a21e39bf478ac
+                    remote: https://github.com/Fane-Nathan/TMRL-Test.git
+                gpu: NVIDIA GeForce GTX 1650
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Turing
+                      cudaCores: 896
+                      memoryTotal: "4294967296"
+                      name: NVIDIA GeForce GTX 1650
+                      uuid: GPU-6c2ed864-a983-393e-0b0b-88585f527827
+                host: FelixNathaniel
+                memory:
+                    total: "25459941376"
+                os: Windows-10-10.0.26200-SP0
+                program: C:\Users\felix\OneDrive\Documents\Data Mining\tmrl\hyperparameter_sweep_optuna.py
+                python: CPython 3.11.9
+                root: C:\Users\felix\OneDrive\Documents\Data Mining\tmrl
+                startedAt: "2026-02-12T05:48:13.219617Z"
+                writerId: 3riyt0ah30tdbcnzz3lgk4zs2e0y9ik7
+        m: []
+        python_version: 3.11.9
+        t:
+            "1":
+                - 1
+                - 35
+                - 105
+            "2":
+                - 1
+                - 35
+                - 105
+            "3":
+                - 2
+                - 13
+                - 16
+            "4": 3.11.9
+            "5": 0.24.0
+            "8":
+                - 3
+            "10":
+                - 20
+            "12": 0.24.0
+            "13": windows-amd64
+hyperparameters:
+    value:
+        alpha: 0.19843966652221853
+        alpha_floor: 0.015957084694148364
+        batch_size: 256
+        betas_actor_str: 0.9,0.999
+        betas_critic_str: 0.95,0.999
+        gamma: 0.9528460969962418
+        l2_actor: 0.0008123245085588687
+        l2_critic: 0.0003142880890840109
+        lr_actor: 5.6115164153345e-05
+        lr_critic: 0.0007969454818643932
+        lr_entropy: 0.001570297088405539
+        polyak: 0.9977955853119744
+        redq_m: 2
+        redq_n: 4
+        target_entropy: -2.6099533988939085
+max_epochs:
+    value: 3
+test_mode:
+    value: true
+trial_number:
+    value: 2

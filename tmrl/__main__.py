@@ -34,7 +34,7 @@ def main(args):
                            crc_debug=cfg.CRC_DEBUG,
                            standalone=args.test)
         if args.worker:
-            rw.run()
+            rw.run(test_episode_interval=cfg.TEST_EPISODE_INTERVAL)
         elif args.expert:
             rw.run(expert=True)
         elif args.benchmark:

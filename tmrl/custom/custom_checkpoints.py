@@ -88,7 +88,7 @@ def update_run_instance(run_instance, training_cls):
     # update training Agent:
     ALG_CONFIG = cfg.TMRL_CONFIG["ALG"]
     ALG_NAME = ALG_CONFIG["ALGORITHM"]
-    assert ALG_NAME in ["SAC", "REDQSAC"], f"{ALG_NAME} is not supported by this checkpoint updater."
+    assert ALG_NAME in ["SAC", "REDQSAC", "DROQSAC"], f"{ALG_NAME} is not supported by this checkpoint updater."
 
     if ALG_NAME in ["SAC", "REDQSAC"]:
         lr_actor = ALG_CONFIG["LR_ACTOR"]
@@ -145,7 +145,7 @@ def update_run_instance(run_instance, training_cls):
             run_instance.agent.target_entropy = float(target_entropy)
         logging.info(f"Target entropy: {run_instance.agent.target_entropy}.")
 
-        if ALG_NAME == "REDQSAC":
+        if ALG_NAME in ["REDQSAC", "DROQSAC"]:
             m = ALG_CONFIG["REDQ_M"]
             q_updates_per_policy_update = ALG_CONFIG["REDQ_Q_UPDATES_PER_POLICY_UPDATE"]
 

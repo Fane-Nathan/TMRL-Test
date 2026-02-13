@@ -5,7 +5,7 @@ GRU-Only and Vanilla (No Context) baselines for comparison
 against the full "Everything" architecture.
 
 Usage: Set TMRL_CONTEXT_MODE env var before starting trainer:
-  - "everything" (default): Full Transformer+GRU+FiLM
+  - "contextual_film" (default): Full Transformer+GRU+FiLM
   - "gru_only": GRU context encoder, no Transformer
   - "baseline": No context encoder, plain MLP
 """
@@ -21,9 +21,11 @@ from torch.nn.utils import spectral_norm
 from tmrl.custom.custom_models import (
     CONTEXT_INPUT_DIM, CONTEXT_Z_DIM, CONTEXT_WINDOW_SIZE, FUSED_DIM,
     FILM_HIDDEN, FILM_N_LAYERS, LOG_STD_MIN, LOG_STD_MAX,
+    _compute_log_std_smooth, _squashed_gaussian_logprob,
     FiLMGenerator, FiLMActorMLP, FiLMQHead,
-    NanoEfficientNetCNN, hybrid_float_mlp, fusion_gate,
+    EffNetV2, NANO_EFFNET_CFG, mlp, FusionGate,
 )
+from tmrl.actor import TorchActorModule
 
 
 # ==============================================================
@@ -102,18 +104,18 @@ class GRUOnlyContextEncoder(nn.Module):
 # Variant B: GRU-Only Actor (uses GRUOnlyContextEncoder + FiLM)
 # ==============================================================
 
-class GRUOnlySharedBackboneHybridActor(nn.Module):
+class GRUOnlySharedBackboneHybridActor(TorchActorModule):
     """Actor using GRU-only context (no Transformer)."""
     def __init__(self, observation_space, action_space):
-        super().__init__()
+        super().__init__(observation_space, action_space)
         act_space = action_space
         act_dim = act_space.shape[0]
         self.act_limit = act_space.high[0]
 
         # Same perception as Everything
-        self.cnn = NanoEfficientNetCNN()
-        self.float_mlp = hybrid_float_mlp()
-        self.fusion_gate = fusion_gate()
+        self.cnn = EffNetV2(cfgs=NANO_EFFNET_CFG, nb_channels_in=4, dim_output=128)
+        self.float_mlp = mlp([28, 64, 64], nn.ReLU, nn.ReLU)
+        self.fusion_gate = FusionGate(img_dim=128, float_dim=64, fused_dim=FUSED_DIM)
 
         # GRU-only context (THIS IS THE DIFFERENCE)
         self.context_encoder = GRUOnlyContextEncoder()
@@ -122,7 +124,13 @@ class GRUOnlySharedBackboneHybridActor(nn.Module):
         self.net = FiLMActorMLP(input_dim=FUSED_DIM, hidden_dim=FILM_HIDDEN, n_layers=FILM_N_LAYERS)
         self.mu_layer = nn.Linear(FILM_HIDDEN, act_dim)
         self.log_std_layer = nn.Linear(FILM_HIDDEN, act_dim)
+        self.std_net = nn.Sequential(
+            nn.Linear(FUSED_DIM, 64),
+            nn.SiLU(),
+            nn.Linear(64, act_dim)
+        )
         self._gru_hidden = None
+        self._online_prev_reward = 0.0
 
     def forward(self, obs, test=False, with_logprob=True):
         speed, gear, rpm, images, lidar, act1, act2 = obs
@@ -132,7 +140,8 @@ class GRUOnlySharedBackboneHybridActor(nn.Module):
         fused = self.fusion_gate(img_embed, float_embed)
 
         # Build context step for online GRU
-        context_step = torch.cat((speed, lidar, act1, torch.zeros_like(speed)), dim=-1)
+        prev_reward = torch.full_like(speed, float(self._online_prev_reward))
+        context_step = torch.cat((speed, lidar, act1, prev_reward), dim=-1)
         if self._gru_hidden is None:
             self._gru_hidden = self.context_encoder.get_initial_hidden(
                 batch_size=fused.shape[0], device=fused.device)
@@ -141,15 +150,15 @@ class GRUOnlySharedBackboneHybridActor(nn.Module):
         film_params = self.film_generator(z)
         net_out = self.net(fused, film_params)
         mu = self.mu_layer(net_out)
-        log_std = torch.clamp(self.log_std_layer(net_out), LOG_STD_MIN, LOG_STD_MAX)
+        log_std_raw = self.std_net(fused)
+        log_std = _compute_log_std_smooth(log_std_raw)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)
         pi_action = mu if test else pi_distribution.rsample()
 
         if with_logprob:
-            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
-            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
+            logp_pi, _ = _squashed_gaussian_logprob(pi_distribution, pi_action)
         else:
             logp_pi = None
 
@@ -163,7 +172,14 @@ class GRUOnlySharedBackboneHybridActor(nn.Module):
 
     def reset_context(self):
         self._gru_hidden = None
+        self._online_prev_reward = 0.0
         self.context_encoder.reset_online_state()
+
+    def set_online_transition(self, reward=0.0, terminated=False, truncated=False, train_mode=True):
+        if terminated or truncated:
+            self._online_prev_reward = 0.0
+        else:
+            self._online_prev_reward = float(reward)
 
 
 class GRUOnlyDroQHybridActorCritic(nn.Module):
@@ -204,20 +220,20 @@ class GRUOnlyDroQHybridActorCritic(nn.Module):
     def actor_from_features(self, fused, film_params, test=False, with_logprob=True):
         net_out = self.actor.net(fused, film_params)
         mu = self.actor.mu_layer(net_out)
-        log_std = torch.clamp(self.actor.log_std_layer(net_out), LOG_STD_MIN, LOG_STD_MAX)
+        log_std_raw = self.actor.std_net(fused)
+        log_std = _compute_log_std_smooth(log_std_raw)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)
         pi_action = mu if test else pi_distribution.rsample()
 
         if with_logprob:
-            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
-            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
+            logp_total, logp_per_dim = _squashed_gaussian_logprob(pi_distribution, pi_action)
         else:
-            logp_pi = None
+            logp_total, logp_per_dim = None, None
 
         pi_action = torch.tanh(pi_action) * self.actor.act_limit
-        return pi_action, logp_pi
+        return pi_action, logp_total, logp_per_dim
 
     def q_from_features(self, fused, act, film_params, q_idx=None):
         if q_idx is not None:
@@ -273,21 +289,26 @@ class VanillaQHead(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-class VanillaSharedBackboneHybridActor(nn.Module):
+class VanillaSharedBackboneHybridActor(TorchActorModule):
     """Actor with NO context encoder, NO FiLM. Pure reactive policy."""
     def __init__(self, observation_space, action_space):
-        super().__init__()
+        super().__init__(observation_space, action_space)
         act_dim = action_space.shape[0]
         self.act_limit = action_space.high[0]
 
-        self.cnn = NanoEfficientNetCNN()
-        self.float_mlp = hybrid_float_mlp()
-        self.fusion_gate = fusion_gate()
+        self.cnn = EffNetV2(cfgs=NANO_EFFNET_CFG, nb_channels_in=4, dim_output=128)
+        self.float_mlp = mlp([28, 64, 64], nn.ReLU, nn.ReLU)
+        self.fusion_gate = FusionGate(img_dim=128, float_dim=64, fused_dim=FUSED_DIM)
 
         # Plain MLP, no FiLM
         self.net = VanillaActorMLP(input_dim=FUSED_DIM, hidden_dim=FILM_HIDDEN, n_layers=FILM_N_LAYERS)
         self.mu_layer = nn.Linear(FILM_HIDDEN, act_dim)
         self.log_std_layer = nn.Linear(FILM_HIDDEN, act_dim)
+        self.std_net = nn.Sequential(
+            nn.Linear(FUSED_DIM, 64),
+            nn.SiLU(),
+            nn.Linear(64, act_dim)
+        )
 
     def forward(self, obs, test=False, with_logprob=True):
         speed, gear, rpm, images, lidar, act1, act2 = obs
@@ -298,15 +319,15 @@ class VanillaSharedBackboneHybridActor(nn.Module):
 
         net_out = self.net(fused)
         mu = self.mu_layer(net_out)
-        log_std = torch.clamp(self.log_std_layer(net_out), LOG_STD_MIN, LOG_STD_MAX)
+        log_std_raw = self.std_net(fused)
+        log_std = _compute_log_std_smooth(log_std_raw)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)
         pi_action = mu if test else pi_distribution.rsample()
 
         if with_logprob:
-            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
-            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
+            logp_pi, _ = _squashed_gaussian_logprob(pi_distribution, pi_action)
         else:
             logp_pi = None
 
@@ -355,20 +376,20 @@ class VanillaDroQHybridActorCritic(nn.Module):
     def actor_from_features(self, fused, film_params, test=False, with_logprob=True):
         net_out = self.actor.net(fused)
         mu = self.actor.mu_layer(net_out)
-        log_std = torch.clamp(self.actor.log_std_layer(net_out), LOG_STD_MIN, LOG_STD_MAX)
+        log_std_raw = self.actor.std_net(fused)
+        log_std = _compute_log_std_smooth(log_std_raw)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)
         pi_action = mu if test else pi_distribution.rsample()
 
         if with_logprob:
-            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
-            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
+            logp_total, logp_per_dim = _squashed_gaussian_logprob(pi_distribution, pi_action)
         else:
-            logp_pi = None
+            logp_total, logp_per_dim = None, None
 
         pi_action = torch.tanh(pi_action) * self.actor.act_limit
-        return pi_action, logp_pi
+        return pi_action, logp_total, logp_per_dim
 
     def q_from_features(self, fused, act, film_params, q_idx=None):
         if q_idx is not None:

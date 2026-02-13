@@ -41,9 +41,15 @@ assert version.parse(CONFIG_VERSION) >= version.parse(__compatibility__), \
 
 # GENERAL: ===========================================================
 
-RUN_NAME = TMRL_CONFIG["RUN_NAME"]  # "SACv1_SPINUP_4_LIDAR_pretrained_test_9"
+RUN_NAME = os.environ.get("TMRL_RUN_NAME", TMRL_CONFIG["RUN_NAME"])  # "SACv1_SPINUP_4_LIDAR_pretrained_test_9"
+os.environ.setdefault("TMRL_RUN_NAME", RUN_NAME)
 BUFFERS_MAXLEN = TMRL_CONFIG["BUFFERS_MAXLEN"]  # Maximum length of the local buffers for RolloutWorkers, Server and TrainerInterface
 RW_MAX_SAMPLES_PER_EPISODE = TMRL_CONFIG["RW_MAX_SAMPLES_PER_EPISODE"]  # If this number of timesteps is reached, the RolloutWorker will reset the episode
+TEST_EPISODE_INTERVAL = TMRL_CONFIG.get("TEST_EPISODE_INTERVAL", 10)  # Run one test episode every N train episodes on workers
+TEST_EVAL_MODE = str(TMRL_CONFIG.get("TEST_EVAL_MODE", "dual")).lower()  # one of: deterministic, stochastic, dual
+if TEST_EVAL_MODE not in ("deterministic", "stochastic", "dual"):
+    logging.warning(f" Invalid TEST_EVAL_MODE='{TEST_EVAL_MODE}', falling back to 'dual'.")
+    TEST_EVAL_MODE = "dual"
 
 PRAGMA_RNN = False  # True to use an RNN, False to use an MLP
 
@@ -108,9 +114,11 @@ REWARD_PATH = str(REWARD_FOLDER / "reward.pkl")
 WANDB_RUN_ID = RUN_NAME
 WANDB_PROJECT = TMRL_CONFIG["WANDB_PROJECT"]
 WANDB_ENTITY = TMRL_CONFIG["WANDB_ENTITY"]
-WANDB_KEY = TMRL_CONFIG["WANDB_KEY"]
-
-os.environ['WANDB_API_KEY'] = WANDB_KEY
+WANDB_KEY = os.environ.get("WANDB_API_KEY", "")
+if not WANDB_KEY and TMRL_CONFIG.get("WANDB_KEY"):
+    logging.warning(
+        "WANDB_KEY in config.json is ignored. Set WANDB_API_KEY in your environment."
+    )
 
 # NETWORKING: ==================================================
 

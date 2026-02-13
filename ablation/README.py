@@ -3,7 +3,7 @@
 # This script runs training with a specific architecture variant.
 #
 # Usage:
-#   $env:TMRL_RUN_NAME="everything"; python -m tmrl --trainer
+#   $env:TMRL_RUN_NAME="contextual_film"; python -m tmrl --trainer
 #   $env:TMRL_RUN_NAME="gru_only"; python -m tmrl --trainer
 #   $env:TMRL_RUN_NAME="baseline"; python -m tmrl --trainer
 #
@@ -17,37 +17,21 @@
 #
 # ## Quick Start
 #
-# ### Step 1: Run the "Everything" Architecture (Current)
+# ### Step 1: Run the "Contextual FiLM" Architecture (Current)
 # ```powershell
-# $env:TMRL_RUN_NAME="everything"
+# $env:TMRL_RUN_NAME="contextual_film"
 # python -m tmrl --trainer
 # ```
 # (Let it run for 2+ hours, then Ctrl+C)
 #
-# ### Step 2: Switch to GRU-Only (Pre-Thesis Baseline)
-# In config_objects.py line 51, change:
-#   TRAIN_MODEL = ContextualDroQHybridActorCritic
-# to:
-#   TRAIN_MODEL = GRUOnlyDroQHybridActorCritic
-#
-# Delete old weights:
+# ### Step 2: Run GRU-Only (Pre-Thesis Baseline)
 # ```powershell
-# Remove-Item ~/TmrlData/weights/* -Force
-# Remove-Item ~/TmrlData/checkpoints/* -Force
-# $env:TMRL_RUN_NAME="gru_only"
-# python -m tmrl --trainer
+# python ablation/run_experiment.py gru_only
 # ```
 #
-# ### Step 3: Switch to Vanilla Baseline (No Context)
-# In config_objects.py line 51, change to:
-#   TRAIN_MODEL = VanillaDroQHybridActorCritic
-#
-# Delete old weights and run:
+# ### Step 3: Run Reactive Baseline (No Context, DroQ loop unchanged)
 # ```powershell
-# Remove-Item ~/TmrlData/weights/* -Force
-# Remove-Item ~/TmrlData/checkpoints/* -Force
-# $env:TMRL_RUN_NAME="baseline"
-# python -m tmrl --trainer
+# python ablation/run_experiment.py baseline
 # ```
 #
 # ### Step 4: Generate Comparison Charts

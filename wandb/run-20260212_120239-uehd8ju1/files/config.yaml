@@ -1,0 +1,67 @@
+_wandb:
+    value:
+        cli_version: 0.24.0
+        e:
+            fsfli8uofzpk2v9ssrmefu78163vub6r:
+                args:
+                    - --test-mode
+                codePath: hyperparameter_sweep_optuna.py
+                codePathLocal: hyperparameter_sweep_optuna.py
+                email: compte.tmrl@gmail.com
+                executable: C:\Users\felix\OneDrive\Documents\Data Mining\.venv\Scripts\python.exe
+                git:
+                    commit: 78c1121c54f014b040a48baad12a21e39bf478ac
+                    remote: https://github.com/Fane-Nathan/TMRL-Test.git
+                host: FelixNathaniel
+                os: Windows-10-10.0.26200-SP0
+                program: C:\Users\felix\OneDrive\Documents\Data Mining\tmrl\hyperparameter_sweep_optuna.py
+                python: CPython 3.11.9
+                root: C:\Users\felix\OneDrive\Documents\Data Mining\tmrl
+                startedAt: "2026-02-12T05:02:39.096830Z"
+                writerId: fsfli8uofzpk2v9ssrmefu78163vub6r
+        m: []
+        python_version: 3.11.9
+        t:
+            "1":
+                - 1
+                - 35
+                - 105
+            "2":
+                - 1
+                - 35
+                - 105
+            "3":
+                - 2
+                - 13
+                - 16
+            "4": 3.11.9
+            "5": 0.24.0
+            "8":
+                - 3
+            "10":
+                - 20
+            "12": 0.24.0
+            "13": windows-amd64
+hyperparameters:
+    value:
+        alpha: 0.06410050209458451
+        alpha_floor: 0.06729596646792112
+        batch_size: 128
+        betas_actor_str: 0.95,0.999
+        betas_critic_str: 0.9,0.999
+        gamma: 0.96540344307274
+        l2_actor: 0.0001847793417351927
+        l2_critic: 4.857295179217169e-06
+        lr_actor: 0.00011103647313054615
+        lr_critic: 7.162786999897333e-05
+        lr_entropy: 1.1919481947918725e-05
+        polyak: 0.9945771362204823
+        redq_m: 1
+        redq_n: 2
+        target_entropy: -2.9214270357831644
+max_epochs:
+    value: 3
+test_mode:
+    value: true
+trial_number:
+    value: 4

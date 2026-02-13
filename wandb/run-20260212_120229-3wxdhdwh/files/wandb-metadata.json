@@ -1,0 +1,20 @@
+{
+  "os":  "Windows-10-10.0.26200-SP0",
+  "python":  "CPython 3.11.9",
+  "startedAt":  "2026-02-12T05:02:29.073233Z",
+  "args":  [
+    "--test-mode"
+  ],
+  "program":  "C:\\Users\\felix\\OneDrive\\Documents\\Data Mining\\tmrl\\hyperparameter_sweep_optuna.py",
+  "codePath":  "hyperparameter_sweep_optuna.py",
+  "codePathLocal":  "hyperparameter_sweep_optuna.py",
+  "git":  {
+    "remote":  "https://github.com/Fane-Nathan/TMRL-Test.git",
+    "commit":  "78c1121c54f014b040a48baad12a21e39bf478ac"
+  },
+  "email":  "compte.tmrl@gmail.com",
+  "root":  "C:\\Users\\felix\\OneDrive\\Documents\\Data Mining\\tmrl",
+  "host":  "FelixNathaniel",
+  "executable":  "C:\\Users\\felix\\OneDrive\\Documents\\Data Mining\\.venv\\Scripts\\python.exe",
+  "writerId":  "6bnb4e6zf5359mld3dpkb2yo59zrjod3"
+}

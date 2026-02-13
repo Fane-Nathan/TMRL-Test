@@ -1,0 +1,61 @@
+_wandb:
+    value:
+        cli_version: 0.24.0
+        e:
+            5litkbkabx33munvidi3qnp1reriqffz:
+                args:
+                    - --test-mode
+                codePath: hyperparameter_sweep_optuna.py
+                codePathLocal: hyperparameter_sweep_optuna.py
+                cpu_count: 8
+                cpu_count_logical: 12
+                cudaVersion: "13.1"
+                disk:
+                    /:
+                        total: "1023099793408"
+                        used: "733454278656"
+                email: compte.tmrl@gmail.com
+                executable: C:\Users\felix\OneDrive\Documents\Data Mining\.venv\Scripts\python.exe
+                git:
+                    commit: 78c1121c54f014b040a48baad12a21e39bf478ac
+                    remote: https://github.com/Fane-Nathan/TMRL-Test.git
+                gpu: NVIDIA GeForce GTX 1650
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Turing
+                      cudaCores: 896
+                      memoryTotal: "4294967296"
+                      name: NVIDIA GeForce GTX 1650
+                      uuid: GPU-6c2ed864-a983-393e-0b0b-88585f527827
+                host: FelixNathaniel
+                memory:
+                    total: "25459941376"
+                os: Windows-10-10.0.26200-SP0
+                program: C:\Users\felix\OneDrive\Documents\Data Mining\tmrl\hyperparameter_sweep_optuna.py
+                python: CPython 3.11.9
+                root: C:\Users\felix\OneDrive\Documents\Data Mining\tmrl
+                startedAt: "2026-02-12T05:02:36.764742Z"
+                writerId: 5litkbkabx33munvidi3qnp1reriqffz
+        m: []
+        python_version: 3.11.9
+        t:
+            "1":
+                - 1
+                - 35
+                - 105
+            "2":
+                - 1
+                - 35
+                - 105
+            "3":
+                - 2
+                - 17
+            "4": 3.11.9
+            "5": 0.24.0
+            "8":
+                - 3
+            "12": 0.24.0
+            "13": windows-amd64
+direction:
+    value:
+        - MAXIMIZE

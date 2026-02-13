@@ -1,0 +1,43 @@
+{
+  "os":  "Windows-10-10.0.26200-SP0",
+  "python":  "CPython 3.11.9",
+  "startedAt":  "2026-02-12T05:30:08.441179Z",
+  "args":  [
+    "--test-mode"
+  ],
+  "program":  "C:\\Users\\felix\\OneDrive\\Documents\\Data Mining\\tmrl\\hyperparameter_sweep_optuna.py",
+  "codePath":  "hyperparameter_sweep_optuna.py",
+  "codePathLocal":  "hyperparameter_sweep_optuna.py",
+  "git":  {
+    "remote":  "https://github.com/Fane-Nathan/TMRL-Test.git",
+    "commit":  "78c1121c54f014b040a48baad12a21e39bf478ac"
+  },
+  "email":  "compte.tmrl@gmail.com",
+  "root":  "C:\\Users\\felix\\OneDrive\\Documents\\Data Mining\\tmrl",
+  "host":  "FelixNathaniel",
+  "executable":  "C:\\Users\\felix\\OneDrive\\Documents\\Data Mining\\.venv\\Scripts\\python.exe",
+  "cpu_count":  8,
+  "cpu_count_logical":  12,
+  "gpu":  "NVIDIA GeForce GTX 1650",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "1023099793408",
+      "used":  "733801779200"
+    }
+  },
+  "memory":  {
+    "total":  "25459941376"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce GTX 1650",
+      "memoryTotal":  "4294967296",
+      "cudaCores":  896,
+      "architecture":  "Turing",
+      "uuid":  "GPU-6c2ed864-a983-393e-0b0b-88585f527827"
+    }
+  ],
+  "cudaVersion":  "13.1",
+  "writerId":  "avrf2v46pu3fybzj010kksd0psvehkyf"
+}

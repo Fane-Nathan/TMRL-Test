@@ -38,15 +38,15 @@ matplotlib.rcParams.update({
 
 # Colors for each variant
 COLORS = {
-    'everything': '#2196F3',   # Blue
+    'contextual_film': '#2196F3',   # Blue
     'gru_only': '#FF9800',     # Orange
     'baseline': '#9E9E9E',     # Gray
 }
 
 LABELS = {
-    'everything': 'Everything (Transformer+GRU+FiLM)',
+    'contextual_film': 'Contextual FiLM (Transformer+GRU+FiLM)',
     'gru_only': 'GRU-Only Context (Pre-Thesis)',
-    'baseline': 'Vanilla SAC (No Context)',
+    'baseline': 'Reactive DroQ Baseline (No Context)',
 }
 
 

@@ -45,8 +45,22 @@ def count_vars(module):
 
 
 LOG_STD_MAX = 2
-LOG_STD_MIN = -20
+LOG_STD_MIN = -2
 EPSILON = 1e-7
+
+
+def _compute_log_std_smooth(log_std_raw):
+    """Tanh-based smooth log_std parametrization. Always has gradient."""
+    return LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (torch.tanh(log_std_raw) + 1)
+
+
+def _squashed_gaussian_logprob(pi_distribution, pi_action):
+    """Compute per-dim and total log prob with tanh squashing correction."""
+    logp_per_dim = pi_distribution.log_prob(pi_action)
+    tanh_correction = 2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))
+    logp_per_dim = logp_per_dim - tanh_correction
+    logp_total = logp_per_dim.sum(dim=-1)
+    return logp_total, logp_per_dim
 
 
 class SquashedGaussianMLPActor(TorchActorModule):
@@ -918,6 +932,11 @@ class SharedBackboneHybridActor(TorchActorModule):
         self.net = mlp([128 + 64, 256, 256], SiLU, SiLU)
         self.mu_layer = nn.Linear(256, dim_act)
         self.log_std_layer = nn.Linear(256, dim_act)
+        self.std_net = nn.Sequential(
+            nn.Linear(128 + 64, 64),
+            nn.SiLU(),
+            nn.Linear(64, dim_act)
+        )
         self.act_limit = act_limit
 
     def forward(self, obs, test=False, with_logprob=True):
@@ -932,9 +951,11 @@ class SharedBackboneHybridActor(TorchActorModule):
 
         # Policy
         net_out = self.net(features)
+
+        # Policy head - DECOUPLED mu/std
         mu = self.mu_layer(net_out)
-        log_std = self.log_std_layer(net_out)
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        log_std_raw = self.std_net(features)
+        log_std = _compute_log_std_smooth(log_std_raw)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)
@@ -944,8 +965,7 @@ class SharedBackboneHybridActor(TorchActorModule):
             pi_action = pi_distribution.rsample()
 
         if with_logprob:
-            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
-            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
+            logp_pi, _ = _squashed_gaussian_logprob(pi_distribution, pi_action)
         else:
             logp_pi = None
 
@@ -991,14 +1011,15 @@ class SharedBackboneHybridActorCritic(nn.Module):
         float_embed = self._actor_float_mlp(floats)
         combined = torch.cat((img_embed, float_embed), dim=-1)
         features = self._actor_fusion_norm(combined)
-        return features
+        return features, None, None
 
-    def actor_from_features(self, features, test=False, with_logprob=True):
+    def actor_from_features(self, features, film=None, test=False, with_logprob=True):
         """Compute action from pre-extracted features."""
+        del film
         net_out = self.actor.net(features)
         mu = self.actor.mu_layer(net_out)
-        log_std = self.actor.log_std_layer(net_out)
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        log_std_raw = self.actor.std_net(features)
+        log_std = _compute_log_std_smooth(log_std_raw)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)
@@ -1008,14 +1029,13 @@ class SharedBackboneHybridActorCritic(nn.Module):
             pi_action = pi_distribution.rsample()
 
         if with_logprob:
-            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
-            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
+            logp_total, logp_per_dim = _squashed_gaussian_logprob(pi_distribution, pi_action)
         else:
-            logp_pi = None
+            logp_total, logp_per_dim = None, None
 
         pi_action = torch.tanh(pi_action)
         pi_action = self.actor.act_limit * pi_action
-        return pi_action, logp_pi
+        return pi_action, logp_total, logp_per_dim
 
     def q_from_features(self, features, act, q_idx=None):
         """Compute Q-values from pre-extracted features."""
@@ -1103,14 +1123,15 @@ class DroQHybridActorCritic(nn.Module):
         float_embed = self._actor_float_mlp(floats)
         combined = torch.cat((img_embed, float_embed), dim=-1)
         features = self._actor_fusion_norm(combined)
-        return features
+        return features, None, None
 
-    def actor_from_features(self, features, test=False, with_logprob=True):
+    def actor_from_features(self, features, film=None, test=False, with_logprob=True):
         """Compute action from pre-extracted features."""
+        del film
         net_out = self.actor.net(features)
         mu = self.actor.mu_layer(net_out)
-        log_std = self.actor.log_std_layer(net_out)
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        log_std_raw = self.actor.std_net(features)
+        log_std = _compute_log_std_smooth(log_std_raw)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)
@@ -1120,14 +1141,13 @@ class DroQHybridActorCritic(nn.Module):
             pi_action = pi_distribution.rsample()
 
         if with_logprob:
-            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
-            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
+            logp_total, logp_per_dim = _squashed_gaussian_logprob(pi_distribution, pi_action)
         else:
-            logp_pi = None
+            logp_total, logp_per_dim = None, None
 
         pi_action = torch.tanh(pi_action)
         pi_action = self.actor.act_limit * pi_action
-        return pi_action, logp_pi
+        return pi_action, logp_total, logp_per_dim
 
     def q_from_features(self, features, act, q_idx=None):
         """Compute Q-values from pre-extracted features."""
@@ -1147,6 +1167,8 @@ CONTEXT_WINDOW_SIZE = 16  # K: number of recent transitions for context
 CONTEXT_INPUT_DIM = 24    # speed(1) + lidar(19) + action(3) + reward(1)
 CONTEXT_Z_DIM = 64        # latent context dimension (widened for richer context)
 FUSED_DIM = 128           # output dimension of fusion gate (widened for capacity)
+FILM_HIDDEN = 256         # hidden dimension for FiLM-modulated actor/critic MLPs
+FILM_N_LAYERS = 2         # number of FiLM-modulated layers
 
 
 class FusionGate(nn.Module):
@@ -1178,20 +1200,13 @@ class FusionGate(nn.Module):
         return self.norm(fused)
 
 
+
 class ContextEncoder(nn.Module):
     """
-    Transformer-Enhanced Context Encoder for rapid adaptation.
-    
-    Training pipeline (full sequence):
-      Context (B,K,24) → Temporal Deltas (B,K,48) → +Sinusoidal PE
-      → Transformer Encoder Layer (self-attn + FFN)
-      → GRU (sequential aggregation) → all outputs (B,K,z_dim)
-      → Cross-Attention (fused obs queries history)
-      → Learned Compression (4 query tokens pool sequence)
-      → z (B, z_dim)
-    
-    Online pipeline (single-step for real-time inference):
-      context_step → delta → GRU step → z (lightweight)
+    ROBUST CAUSAL CONTEXT ENCODER (Patched for Stability)
+    - Fixed Logic Error: Now uses Transformer during inference (Sliding Window).
+    - Causal Masking: Prevents "cheating" by looking at future tokens.
+    - Spectral Normalization: Prevents gradient explosions (Entropy Saver).
     """
     REWARD_HORIZONS = [1, 3, 5]
 
@@ -1200,176 +1215,100 @@ class ContextEncoder(nn.Module):
         super().__init__()
         self.z_dim = z_dim
         self.input_dim = input_dim
-        enriched_dim = input_dim * 2  # raw + deltas = 48
+        self.max_len = max_len
+        enriched_dim = input_dim * 2  # raw + deltas
 
-        # === 1. Sinusoidal Positional Encoding ===
+        # === 1. Positional Encoding ===
         pe = torch.zeros(max_len, enriched_dim)
         position = torch.arange(0, max_len).unsqueeze(1).float()
-        div_term = torch.exp(
-            torch.arange(0, enriched_dim, 2).float() * -(np.log(10000.0) / enriched_dim)
-        )
+        div_term = torch.exp(torch.arange(0, enriched_dim, 2).float() * -(np.log(10000.0) / enriched_dim))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pos_enc', pe.unsqueeze(0))  # (1, max_len, 48)
+        self.register_buffer('pos_enc', pe.unsqueeze(0))
 
-        # === 2. Dual-Stream Transformers ===
-        # State stream: speed(1) + lidar(19) + their deltas = 40 dims
-        # Action stream: action(3) + reward(1) + their deltas = 8 dims
-        self.state_dim = 40  # indices 0:20 and 24:44
-        self.action_dim = 8  # indices 20:24 and 44:48
-        self.state_proj = nn.Linear(self.state_dim, enriched_dim)
-        self.action_proj = nn.Linear(self.action_dim, enriched_dim)
+        # === 2. Stabilized Projections (Spectral Norm) ===
+        from torch.nn.utils import spectral_norm
+        self.state_dim = 40
+        self.action_dim = 8
+        self.state_proj = spectral_norm(nn.Linear(self.state_dim, enriched_dim))
+        self.action_proj = spectral_norm(nn.Linear(self.action_dim, enriched_dim))
 
+        # === 3. Causal Transformers (Dropout enabled) ===
+        # norm_first=True (Pre-LN) is crucial for RL gradient flow stability
         state_layer = nn.TransformerEncoderLayer(
             d_model=enriched_dim, nhead=4, dim_feedforward=128,
-            dropout=0.0, batch_first=True, norm_first=True
+            dropout=0.1, batch_first=True, norm_first=True
         )
         self.state_transformer = nn.TransformerEncoder(state_layer, num_layers=2)
 
         action_layer = nn.TransformerEncoderLayer(
             d_model=enriched_dim, nhead=4, dim_feedforward=128,
-            dropout=0.0, batch_first=True, norm_first=True
+            dropout=0.1, batch_first=True, norm_first=True
         )
         self.action_transformer = nn.TransformerEncoder(action_layer, num_layers=2)
 
-        self.stream_gate = nn.Sequential(
-            nn.Linear(enriched_dim * 2, enriched_dim),
-            nn.Sigmoid()
-        )
-
-        # === 3. GRU for sequential aggregation + online inference ===
+        self.stream_gate = nn.Sequential(nn.Linear(enriched_dim * 2, enriched_dim), nn.Sigmoid())
         self.gru = nn.GRU(enriched_dim, z_dim, num_layers=1, batch_first=True)
 
-        # === 4. Cross-Attention: fused obs queries GRU output ===
-        self.obs_proj = nn.Linear(fused_dim, z_dim)  # project fused (128) → z_dim (64)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=z_dim, num_heads=4, batch_first=True
-        )
-        self.cross_norm = nn.LayerNorm(z_dim)
-
-        # === 5. Learned Context Compression (4 query tokens) ===
+        # Cross Attention & Output
+        self.obs_proj = spectral_norm(nn.Linear(fused_dim, z_dim))
+        self.cross_attn = nn.MultiheadAttention(embed_dim=z_dim, num_heads=4, batch_first=True)
         self.pool_queries = nn.Parameter(torch.randn(1, 4, z_dim) * 0.02)
-        self.pool_attn = nn.MultiheadAttention(
-            embed_dim=z_dim, num_heads=4, batch_first=True
-        )
-        self.compress = nn.Sequential(
-            nn.Linear(4 * z_dim, z_dim),
-            nn.LayerNorm(z_dim)
-        )
-
-        # Output normalization
+        self.pool_attn = nn.MultiheadAttention(embed_dim=z_dim, num_heads=4, batch_first=True)
+        self.compress = nn.Sequential(nn.Linear(4 * z_dim, z_dim), nn.LayerNorm(z_dim))
         self.norm = nn.LayerNorm(z_dim)
 
-        # Multi-step reward prediction heads (1/3/5-step horizons)
+        # Reward Predictors
         self.reward_predictors = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(z_dim, z_dim),
-                nn.ReLU(),
-                nn.Linear(z_dim, 1)
-            )
+            nn.Sequential(nn.Linear(z_dim, z_dim), nn.ReLU(), nn.Linear(z_dim, 1))
             for _ in self.REWARD_HORIZONS
         ])
 
-        # Online inference state
-        self._prev_step = None
+        # Inference Buffer
+        self._window_buffer = None
 
     def _compute_deltas(self, context_seq):
-        """(B, K, 24) → (B, K, 48) = [raw, Δraw]"""
         deltas = context_seq[:, 1:, :] - context_seq[:, :-1, :]
         deltas = F.pad(deltas, (0, 0, 1, 0))
         return torch.cat([context_seq, deltas], dim=-1)
 
+    def _generate_causal_mask(self, size, device):
+        """Prevents attending to the future (Anti-Cheating)."""
+        mask = (torch.triu(torch.ones(size, size, device=device)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+
     def predict_reward(self, z):
-        """Multi-step reward prediction. Returns list of (B,) tensors."""
         return [head(z).squeeze(-1) for head in self.reward_predictors]
 
     def forward(self, context_seq, fused_obs=None):
-        """
-        Full training-time forward pass.
-        Args:
-            context_seq: (B, K, 24)
-            fused_obs: (B, fused_dim) current observation features for cross-attention
-        Returns:
-            z: (B, z_dim) context vector
-        """
-        B = context_seq.shape[0]
+        B, K, _ = context_seq.shape
+        enriched = self._compute_deltas(context_seq)
+        
+        # Split Features
+        state_feats = torch.cat([enriched[:, :, :20], enriched[:, :, 24:44]], dim=-1)
+        action_feats = torch.cat([enriched[:, :, 20:24], enriched[:, :, 44:48]], dim=-1)
+        
+        state_seq = self.state_proj(state_feats) + self.pos_enc[:, :K, :]
+        action_seq = self.action_proj(action_feats) + self.pos_enc[:, :K, :]
 
-        # 1. Temporal deltas + positional encoding
-        enriched = self._compute_deltas(context_seq)  # (B, K, 48)
-        K = enriched.shape[1]
+        # === CAUSAL MASKING ===
+        # Ensures step t can only see steps 0..t
+        causal_mask = self._generate_causal_mask(K, context_seq.device)
+        
+        state_out = self.state_transformer(state_seq, mask=causal_mask)
+        action_out = self.action_transformer(action_seq, mask=causal_mask)
+        
+        # Residual Skip Connection (Gradient Highway)
+        state_out = state_out + state_seq
+        action_out = action_out + action_seq
 
-        # 2. Dual-stream: split into state and action features
-        state_feats = torch.cat([enriched[:, :, :20], enriched[:, :, 24:44]], dim=-1)  # (B, K, 40)
-        action_feats = torch.cat([enriched[:, :, 20:24], enriched[:, :, 44:48]], dim=-1)  # (B, K, 8)
-
-        state_seq = self.state_proj(state_feats) + self.pos_enc[:, :K, :]  # (B, K, 48)
-        action_seq = self.action_proj(action_feats) + self.pos_enc[:, :K, :]  # (B, K, 48)
-
-        state_out = self.state_transformer(state_seq)  # (B, K, 48)
-        action_out = self.action_transformer(action_seq)  # (B, K, 48)
-
-        # Gated merge of dual streams
-        gate = self.stream_gate(torch.cat([state_out, action_out], dim=-1))  # (B, K, 48)
-        transformed = gate * state_out + (1 - gate) * action_out  # (B, K, 48)
-
-        # 3. GRU sequential processing
-        self.gru.flatten_parameters()
-        gru_out, h_n = self.gru(transformed)  # gru_out: (B, K, z_dim)
-
-        # 4. Cross-attention: current obs queries history
-        if fused_obs is not None:
-            obs_query = self.obs_proj(fused_obs).unsqueeze(1)  # (B, 1, z_dim)
-            cross_out, _ = self.cross_attn(obs_query, gru_out, gru_out)  # (B, 1, z_dim)
-            cross_z = cross_out.squeeze(1)  # (B, z_dim)
-        else:
-            cross_z = h_n.squeeze(0)  # fallback to GRU last hidden
-
-        # 5. Learned compression: 4 query tokens pool the sequence
-        queries = self.pool_queries.expand(B, -1, -1)  # (B, 4, z_dim)
-        pooled, _ = self.pool_attn(queries, gru_out, gru_out)  # (B, 4, z_dim)
-        pool_z = self.compress(pooled.reshape(B, -1))  # (B, z_dim)
-
-        # 6. Combine cross-attended + pooled context
-        z = self.norm(cross_z + pool_z)
-        return z
-
-    def get_initial_hidden(self, batch_size=1, device='cpu'):
-        """Get zero-initialized hidden state for inference."""
-        return torch.zeros(1, batch_size, self.z_dim, device=device)
-
-    def reset_online_state(self):
-        """Reset online inference state (call at episode start)."""
-        self._prev_step = None
-
-    def step(self, context_step, hidden, fused_obs=None):
-        """
-        Single-step update for online inference.
-        Applies dual-stream projections and merges before GRU step.
-        """
-        if self._prev_step is not None:
-            delta = context_step - self._prev_step
-        else:
-            delta = torch.zeros_like(context_step)
-        self._prev_step = context_step.detach()
-
-        enriched = torch.cat([context_step, delta], dim=-1)  # (B, 48)
-
-        # Apply projections and gated merge (K=1 version of training path)
-        state_feats = torch.cat([enriched[:, :20], enriched[:, 24:44]], dim=-1)
-        action_feats = torch.cat([enriched[:, 20:24], enriched[:, 44:48]], dim=-1)
-
-        state_proj = self.state_proj(state_feats).unsqueeze(1)    # (B, 1, 48)
-        action_proj = self.action_proj(action_feats).unsqueeze(1)  # (B, 1, 48)
-
-        # Online, we skip the self-attention transformer for single step to save time,
-        # but apply the projections and gating which are essential for feature alignment.
-        gate = self.stream_gate(torch.cat([state_proj, action_proj], dim=-1))
-        transformed = gate * state_proj + (1 - gate) * action_proj
+        gate = self.stream_gate(torch.cat([state_out, action_out], dim=-1))
+        transformed = gate * state_out + (1 - gate) * action_out
 
         self.gru.flatten_parameters()
-        gru_out, h_n = self.gru(transformed, hidden)  # gru_out: (B, 1, z_dim)
+        gru_out, h_n = self.gru(transformed)
 
-        # Apply Cross-Attention and Compression to match training 'z'
         if fused_obs is not None:
             obs_query = self.obs_proj(fused_obs).unsqueeze(1)
             cross_out, _ = self.cross_attn(obs_query, gru_out, gru_out)
@@ -1377,21 +1316,41 @@ class ContextEncoder(nn.Module):
         else:
             cross_z = h_n.squeeze(0)
 
-        queries = self.pool_queries.expand(context_step.shape[0], -1, -1)
+        queries = self.pool_queries.expand(B, -1, -1)
         pooled, _ = self.pool_attn(queries, gru_out, gru_out)
-        pool_z = self.compress(pooled.reshape(context_step.shape[0], -1))
-
+        pool_z = self.compress(pooled.reshape(B, -1))
         z = self.norm(cross_z + pool_z)
-        return z, h_n
+        return z
 
+    def get_initial_hidden(self, batch_size=1, device='cpu'):
+        return torch.zeros(1, batch_size, self.z_dim, device=device)
 
+    def reset_online_state(self):
+        self._window_buffer = None
 
-# ============== FiLM Conditioning ==============
+    def step(self, context_step, hidden, fused_obs=None):
+        """
+        Sliding Window Inference:
+        We now buffer the last K steps and run the FULL Transformer.
+        This guarantees Mathematically Exact consistency between Training and Gameplay.
+        """
+        # 1. Update Buffer
+        if self._window_buffer is None:
+            self._window_buffer = context_step.unsqueeze(1) # (1, 1, 24)
+        else:
+            self._window_buffer = torch.cat([self._window_buffer, context_step.unsqueeze(1)], dim=1)
+        
+        # 2. Trim Buffer (Keep fixed window size)
+        if self._window_buffer.shape[1] > self.max_len:
+            self._window_buffer = self._window_buffer[:, -self.max_len:, :]
 
-FILM_HIDDEN = 512  # hidden dim for FiLM-modulated MLPs (widened from 384)
-FILM_N_LAYERS = 2  # number of FiLM-modulated layers
-
-
+        # 3. Run Full Forward Pass (Robust)
+        # We call forward() directly. It handles masking and deltas.
+        z = self.forward(self._window_buffer, fused_obs=fused_obs)
+        
+        # We don't need to pass hidden state between steps manually anymore 
+        # because the buffer + full forward pass handles the temporal state.
+        return z, None
 class FiLMGenerator(nn.Module):
     """
     Shared FiLM generator: takes context z and produces (γ, β) pairs
@@ -1414,7 +1373,10 @@ class FiLMGenerator(nn.Module):
         nn.init.zeros_(self.net[-1].bias)
         # Set γ bias to 1 (so initial modulation is identity)
         with torch.no_grad():
-            self.net[-1].bias[:n_layers * hidden_dim].fill_(1.0)
+            for i in range(self.n_layers):
+                start = i * self.hidden_dim * 2
+                # Only fill the 'gamma' half of each layer's chunk with 1.0
+                self.net[-1].bias[start : start + self.hidden_dim].fill_(1.0)
 
     def forward(self, z):
         """
@@ -1538,15 +1500,34 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
         self.net = FiLMActorMLP(input_dim=FUSED_DIM, hidden_dim=FILM_HIDDEN, n_layers=FILM_N_LAYERS)
         self.mu_layer = nn.Linear(FILM_HIDDEN, dim_act)
         self.log_std_layer = nn.Linear(FILM_HIDDEN, dim_act)
+        self.std_net = nn.Sequential(
+            nn.Linear(FUSED_DIM, 64),
+            nn.SiLU(),
+            nn.Linear(64, dim_act)
+        )
         self.act_limit = act_limit
+        # Previous reward from worker-side rollout for online context alignment.
+        self._online_prev_reward = 0.0
 
     def _build_context_step(self, obs):
         """Build a single context vector from current observation for online GRU stepping."""
         speed, gear, rpm, images, lidar, act1, act2 = obs
         # action = last action (act1 is the most recent in act_buf)
-        # We use speed + lidar + act1 + zero reward (reward not available at inference)
-        ctx = torch.cat((speed, lidar, act1, torch.zeros_like(speed)), dim=-1)
+        # Use previous rollout reward (set by RolloutWorker) to match training context.
+        prev_reward = torch.full_like(speed, float(self._online_prev_reward))
+        # prev_reward = torch.zeros_like(speed)  # Zero out reward for consistency
+        ctx = torch.cat((speed, lidar, act1, prev_reward), dim=-1)
         return ctx  # (B, 24)
+
+    def set_online_transition(self, reward=0.0, terminated=False, truncated=False, train_mode=True):
+        """
+        Update online context metadata from rollout transitions.
+        Called by RolloutWorker after each environment step.
+        """
+        if terminated or truncated:
+            self._online_prev_reward = 0.0
+        else:
+            self._online_prev_reward = float(reward)
 
     def forward(self, obs, test=False, with_logprob=True):
         speed, gear, rpm, images, lidar, act1, act2 = obs
@@ -1571,10 +1552,10 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
         film_params = self.film_generator(z)
         net_out = self.net(fused, film_params)  # (B, 384)
 
-        # Policy head
+        # Policy head - DECOUPLED mu/std
         mu = self.mu_layer(net_out)
-        log_std = self.log_std_layer(net_out)
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        log_std_raw = self.std_net(fused)
+        log_std = _compute_log_std_smooth(log_std_raw)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)
@@ -1584,8 +1565,7 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
             pi_action = pi_distribution.rsample()
 
         if with_logprob:
-            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
-            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
+            logp_pi, _ = _squashed_gaussian_logprob(pi_distribution, pi_action)
         else:
             logp_pi = None
 
@@ -1601,6 +1581,7 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
     def reset_context(self):
         """Call at the beginning of each episode to reset GRU state."""
         self._gru_hidden = None
+        self._online_prev_reward = 0.0
         self.context_encoder.reset_online_state()
 
 
@@ -1615,7 +1596,7 @@ class ContextualDroQHybridActorCritic(nn.Module):
     - FiLMQHead: Q-networks with FiLM modulation + DroQ dropout
     - Shared FiLM generator for actor + critic (key for deployment adaptation)
     """
-    def __init__(self, observation_space, action_space, dropout_rate=0.01):
+    def __init__(self, observation_space, action_space, dropout_rate=0.05):
         super().__init__()
         self.n = 2  # DroQ uses exactly 2 Q-networks
 
@@ -1671,8 +1652,8 @@ class ContextualDroQHybridActorCritic(nn.Module):
         """Compute action from fused features + FiLM params."""
         net_out = self.actor.net(fused, film_params)  # FiLM-modulated actor MLP
         mu = self.actor.mu_layer(net_out)
-        log_std = self.actor.log_std_layer(net_out)
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        log_std_raw = self.actor.std_net(fused)
+        log_std = _compute_log_std_smooth(log_std_raw)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)
@@ -1682,14 +1663,13 @@ class ContextualDroQHybridActorCritic(nn.Module):
             pi_action = pi_distribution.rsample()
 
         if with_logprob:
-            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
-            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
+            logp_total, logp_per_dim = _squashed_gaussian_logprob(pi_distribution, pi_action)
         else:
-            logp_pi = None
+            logp_total, logp_per_dim = None, None
 
         pi_action = torch.tanh(pi_action)
         pi_action = self.actor.act_limit * pi_action
-        return pi_action, logp_pi
+        return pi_action, logp_total, logp_per_dim
 
     def q_from_features(self, fused, act, film_params, q_idx=None):
         """Compute Q-values from fused features + FiLM params."""

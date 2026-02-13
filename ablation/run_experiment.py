@@ -5,13 +5,13 @@ Run this script to execute one architecture variant.
 Set the variant via command-line argument.
 
 Usage:
-  python ablation/run_experiment.py everything
+  python ablation/run_experiment.py contextual_film
   python ablation/run_experiment.py gru_only
   python ablation/run_experiment.py baseline
 
 Each run:
   1. Sets TMRL_CONTEXT_MODE and TMRL_RUN_NAME env vars
-  2. Deletes old weights/checkpoints (fresh start)
+  2. Deletes old artifacts for this mode only (fresh start)
   3. Launches the trainer
 
 Results are saved to ~/TmrlData/ablation/{variant_name}.csv
@@ -19,23 +19,37 @@ After all runs, plot with: python ablation/plot_comparison.py
 """
 import os
 import sys
-import shutil
 import subprocess
 from pathlib import Path
 
-VALID_MODES = ["everything", "gru_only", "baseline"]
+VALID_MODES = ["contextual_film", "gru_only", "baseline"]
 TMRL_DATA = Path.home() / "TmrlData"
 
 
-def clean_weights():
-    """Delete old weights and checkpoints for fresh training."""
+def clean_mode_artifacts(mode: str):
+    """Delete only mode-specific artifacts for a fresh run of that mode."""
     weights_dir = TMRL_DATA / "weights"
     checkpoints_dir = TMRL_DATA / "checkpoints"
-    for d in [weights_dir, checkpoints_dir]:
-        if d.exists():
-            for f in d.iterdir():
-                f.unlink()
-                print(f"  Deleted: {f}")
+    ablation_dir = TMRL_DATA / "ablation"
+    targets = [
+        weights_dir / f"{mode}.tmod",
+        weights_dir / f"{mode}_t.tmod",
+        checkpoints_dir / f"{mode}_t.tcpt",
+        checkpoints_dir / f"{mode}.tmod",
+        checkpoints_dir / f"{mode}_t.tmod",
+        ablation_dir / f"{mode}.csv",
+    ]
+
+    for path in targets:
+        if path.exists():
+            path.unlink()
+            print(f"  Deleted: {path}")
+
+    if weights_dir.exists():
+        for history_file in weights_dir.glob(f"{mode}_*.tmod"):
+            if history_file.exists():
+                history_file.unlink()
+                print(f"  Deleted: {history_file}")
 
 
 def run_experiment(mode: str):
@@ -43,9 +57,9 @@ def run_experiment(mode: str):
     print(f"  ABLATION EXPERIMENT: {mode.upper()}")
     print("=" * 60)
 
-    # 1. Clean old weights
-    print("\n[1/3] Cleaning old weights and checkpoints...")
-    clean_weights()
+    # 1. Clean old mode-specific artifacts
+    print("\n[1/3] Cleaning mode-specific weights/checkpoints/CSV...")
+    clean_mode_artifacts(mode)
 
     # 2. Set environment variables
     print(f"[2/3] Setting TMRL_CONTEXT_MODE={mode}, TMRL_RUN_NAME={mode}")
@@ -74,11 +88,11 @@ def main():
         print(f"\nValid modes:")
         for m in VALID_MODES:
             desc = {
-                "everything": "Full Transformer+GRU+FiLM (current best)",
+                "contextual_film": "Full Transformer+GRU+FiLM (default, thesis architecture)",
                 "gru_only": "GRU-only context, no Transformer (pre-thesis)",
-                "baseline": "No context, plain MLP (vanilla SAC)",
+                "baseline": "No context, plain MLP (reactive DroQ baseline)",
             }
-            print(f"  {m:15s} - {desc[m]}")
+            print(f"  {m:20s} - {desc[m]}")
         sys.exit(1)
 
     mode = sys.argv[1]
@@ -87,3 +101,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

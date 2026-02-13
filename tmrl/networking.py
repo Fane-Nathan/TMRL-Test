@@ -61,8 +61,12 @@ class Buffer:
         self.memory = []
         self.stat_train_return = 0.0  # stores the train return
         self.stat_test_return = 0.0  # stores the test return
+        self.stat_test_return_det = 0.0  # stores deterministic test return
+        self.stat_test_return_stoch = 0.0  # stores stochastic test return
         self.stat_train_steps = 0  # stores the number of steps per training episode
         self.stat_test_steps = 0  # stores the number of steps per test episode
+        self.stat_test_steps_det = 0  # stores deterministic test steps
+        self.stat_test_steps_stoch = 0  # stores stochastic test steps
         self.maxlen = maxlen
 
     def clip_to_maxlen(self):
@@ -93,10 +97,16 @@ class Buffer:
     def __iadd__(self, other):
         self.memory += other.memory
         self.clip_to_maxlen()
-        self.stat_train_return = other.stat_train_return
-        self.stat_test_return = other.stat_test_return
-        self.stat_train_steps = other.stat_train_steps
-        self.stat_test_steps = other.stat_test_steps
+        if other.stat_train_return != 0.0:
+            self.stat_train_return = other.stat_train_return
+            self.stat_train_steps = other.stat_train_steps
+        if other.stat_test_return != 0.0:
+            self.stat_test_return = other.stat_test_return
+            self.stat_test_steps = other.stat_test_steps
+            self.stat_test_return_det = getattr(other, "stat_test_return_det", other.stat_test_return)
+            self.stat_test_return_stoch = getattr(other, "stat_test_return_stoch", other.stat_test_return)
+            self.stat_test_steps_det = getattr(other, "stat_test_steps_det", other.stat_test_steps)
+            self.stat_test_steps_stoch = getattr(other, "stat_test_steps_stoch", other.stat_test_steps)
         return self
 
 
@@ -562,6 +572,21 @@ class RolloutWorker:
             (nested structure: observation retrieved from the environment,
             dict: information retrieved from the environment)
         """
+        # Reset recurrent/context actor state between episodes when supported.
+        if hasattr(self.actor, "reset_context"):
+            self.actor.reset_context()
+        if hasattr(self.actor, "set_online_transition"):
+            try:
+                self.actor.set_online_transition(
+                    reward=0.0,
+                    terminated=False,
+                    truncated=False,
+                    train_mode=collect_samples
+                )
+            except TypeError:
+                # Backward compatibility for actor modules with the old hook signature.
+                self.actor.set_online_transition(reward=0.0, terminated=False, truncated=False)
+
         obs = None
         try:
             # Faster than hasattr() in real-time environments
@@ -611,6 +636,17 @@ class RolloutWorker:
         """
         act = self.act(obs, test=test)
         new_obs, rew, terminated, truncated, info = self.env.step(act)
+        if hasattr(self.actor, "set_online_transition"):
+            try:
+                self.actor.set_online_transition(
+                    reward=rew,
+                    terminated=terminated,
+                    truncated=truncated,
+                    train_mode=not test
+                )
+            except TypeError:
+                # Backward compatibility for actor modules with the old hook signature.
+                self.actor.set_online_transition(reward=rew, terminated=terminated, truncated=truncated)
         if self.obs_preprocessor is not None:
             new_obs = self.obs_preprocessor(new_obs)
         if collect_samples:
@@ -681,7 +717,49 @@ class RolloutWorker:
             max_samples (int): At most `max_samples` samples are collected per episode.
                 If the episode is longer, it is forcefully reset and `truncated` is set to True.
             train (bool): whether the episode is a training or a test episode.
-                `step` is called with `test=not train`.
+                Truth table:
+                - `train=True` -> `test=False` (stochastic policy path)
+                - `train=False` -> `test=True` (deterministic policy path)
+        """
+        if max_samples is None:
+            max_samples = self.max_samples_per_episode
+
+        # Eval episodes use deterministic actor mode; training episodes use stochastic actor mode.
+        if train:
+            is_eval_episode = False
+        else:
+            is_eval_episode = True
+        use_deterministic_policy = is_eval_episode
+
+        ret, steps = self._run_eval_episode(
+            max_samples=max_samples,
+            deterministic=use_deterministic_policy
+        )
+
+        if use_deterministic_policy:
+            self._set_test_stats(
+                ret_det=ret,
+                steps_det=steps,
+                ret_stoch=ret,
+                steps_stoch=steps,
+                alias="deterministic",
+            )
+        else:
+            self._set_test_stats(
+                ret_det=ret,
+                steps_det=steps,
+                ret_stoch=ret,
+                steps_stoch=steps,
+                alias="stochastic",
+            )
+
+    def _run_eval_episode(self, max_samples=None, deterministic=True):
+        """
+        Runs one evaluation episode without collecting replay samples.
+
+        Args:
+            max_samples (int): same cap as run_episode.
+            deterministic (bool): True uses actor test mode, False uses stochastic mode.
         """
         if max_samples is None:
             max_samples = self.max_samples_per_episode
@@ -692,13 +770,73 @@ class RolloutWorker:
         steps = 0
         obs, info = self.reset(collect_samples=False)
         for _ in iterator:
-            obs, rew, terminated, truncated, info = self.step(obs=obs, test=not train, collect_samples=False)
+            obs, rew, terminated, truncated, info = self.step(
+                obs=obs,
+                test=deterministic,
+                collect_samples=False
+            )
             ret += rew
             steps += 1
             if terminated or truncated:
                 break
-        self.buffer.stat_test_return = ret
-        self.buffer.stat_test_steps = steps
+        return ret, steps
+
+    def _set_test_stats(self, ret_det, steps_det, ret_stoch, steps_stoch, alias="stochastic"):
+        """
+        Writes deterministic/stochastic eval stats and backward-compatible alias fields.
+        """
+        self.buffer.stat_test_return_det = float(ret_det)
+        self.buffer.stat_test_steps_det = int(steps_det)
+        self.buffer.stat_test_return_stoch = float(ret_stoch)
+        self.buffer.stat_test_steps_stoch = int(steps_stoch)
+
+        if alias == "deterministic":
+            self.buffer.stat_test_return = float(ret_det)
+            self.buffer.stat_test_steps = int(steps_det)
+        else:
+            self.buffer.stat_test_return = float(ret_stoch)
+            self.buffer.stat_test_steps = int(steps_stoch)
+
+    def collect_test_episodes(self, max_samples=None):
+        """
+        Runs evaluation episodes according to cfg.TEST_EVAL_MODE.
+
+        Modes:
+            deterministic: one deterministic eval episode (legacy behavior)
+            stochastic: one stochastic eval episode
+            dual: one deterministic + one stochastic episode
+        """
+        mode = cfg.TEST_EVAL_MODE
+
+        if mode == "deterministic":
+            ret_det, steps_det = self._run_eval_episode(max_samples=max_samples, deterministic=True)
+            self._set_test_stats(
+                ret_det=ret_det,
+                steps_det=steps_det,
+                ret_stoch=ret_det,
+                steps_stoch=steps_det,
+                alias="deterministic",
+            )
+        elif mode == "stochastic":
+            ret_stoch, steps_stoch = self._run_eval_episode(max_samples=max_samples, deterministic=False)
+            self._set_test_stats(
+                ret_det=ret_stoch,
+                steps_det=steps_stoch,
+                ret_stoch=ret_stoch,
+                steps_stoch=steps_stoch,
+                alias="stochastic",
+            )
+        else:  # dual
+            ret_det, steps_det = self._run_eval_episode(max_samples=max_samples, deterministic=True)
+            ret_stoch, steps_stoch = self._run_eval_episode(max_samples=max_samples, deterministic=False)
+            # Legacy alias follows stochastic metrics in dual mode.
+            self._set_test_stats(
+                ret_det=ret_det,
+                steps_det=steps_det,
+                ret_stoch=ret_stoch,
+                steps_stoch=steps_stoch,
+                alias="stochastic",
+            )
 
     def run(self, test_episode_interval=0, nb_episodes=np.inf, verbose=True, expert=False):
         """
@@ -740,7 +878,7 @@ class RolloutWorker:
             else:
                 for episode in iterator:
                     if episode % test_episode_interval == 0 and not self.crc_debug:
-                        self.run_episode(self.max_samples_per_episode, train=False)
+                        self.collect_test_episodes(self.max_samples_per_episode)
                     self.collect_train_episode(self.max_samples_per_episode)
                     self.send_and_clear_buffer()
                     self.update_actor_weights(verbose=False)
@@ -748,7 +886,7 @@ class RolloutWorker:
             for episode in iterator:
                 if test_episode_interval and episode % test_episode_interval == 0 and not self.crc_debug:
                     print_with_timestamp("running test episode")
-                    self.run_episode(self.max_samples_per_episode, train=False)
+                    self.collect_test_episodes(self.max_samples_per_episode)
                 print_with_timestamp("collecting train episode")
                 self.collect_train_episode(self.max_samples_per_episode)
                 print_with_timestamp("copying buffer for sending")
@@ -840,7 +978,7 @@ class RolloutWorker:
                 if test_episode_interval > 0 and episode % test_episode_interval == 0 and end_episodes:
                     if verbose:
                         print_with_timestamp("running test episode")
-                    self.run_episode(self.max_samples_per_episode, train=False)
+                    self.collect_test_episodes(self.max_samples_per_episode)
                 # reset
                 obs, info = self.reset(collect_samples=True)
                 done = False
@@ -956,6 +1094,8 @@ class RolloutWorker:
                     if verbose:
                         print_with_timestamp("model weights saved in history")
             self.actor = self.actor.load(self.model_path, device=self.device)
+            if hasattr(self.actor, "reset_context"):
+                self.actor.reset_context()
             if verbose:
                 print_with_timestamp("model weights have been updated")
         return nb_received

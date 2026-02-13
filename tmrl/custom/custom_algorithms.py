@@ -132,6 +132,9 @@ class SpinupSacAgent(TrainingAgent):  # Adapted from Spinup
             loss_alpha.backward()
             self.alpha_optimizer.step()
 
+        with torch.no_grad():
+            limit = getattr(self, "alpha_floor", 0.05) 
+            self.log_alpha.clamp_(min=np.log(limit))
         # Run one gradient descent step for Q1 and Q2
 
         # loss_q:
@@ -471,6 +474,7 @@ class SharedBackboneREDQSACAgent(TrainingAgent):
         self.pi_optimizer = Adam(
             list(self.model.actor.net.parameters()) +
             list(self.model.actor.mu_layer.parameters()) +
+            list(self.model.actor.std_net.parameters()) +
             list(self.model.actor.log_std_layer.parameters()), 
             lr=self.lr_actor
         )
@@ -523,8 +527,8 @@ class SharedBackboneREDQSACAgent(TrainingAgent):
         # === Target Q computation (with no_grad) ===
         with torch.no_grad():
             # Extract features for next obs from TARGET network
-            features_o2_target = self.model_target.forward_features(o2)
-            a2, logp_a2 = self.model_target.actor_from_features(features_o2_target)
+            features_o2_target, _, _ = self.model_target.forward_features(o2)
+            a2, logp_a2, _ = self.model_target.actor_from_features(features_o2_target, None)
 
             sample_idxs = np.random.choice(self.n, self.m, replace=False)
             q_prediction_next_list = [self.model_target.qs[i](features_o2_target, a2) for i in sample_idxs]
@@ -534,7 +538,7 @@ class SharedBackboneREDQSACAgent(TrainingAgent):
 
         # === Critic update ===
         # Extract features for current obs (WITH gradients for encoder from critics)
-        features_o_critic = self.model.forward_features(o)
+        features_o_critic, _, _ = self.model.forward_features(o)
         
         q_prediction_list = [q(features_o_critic, a) for q in self.model.qs]
         q_prediction_cat = torch.stack(q_prediction_list, -1)
@@ -555,8 +559,8 @@ class SharedBackboneREDQSACAgent(TrainingAgent):
 
             # Extract features DETACHED for actor (Actor doesn't update encoder)
             with torch.no_grad():
-                features_o_actor = self.model.forward_features(o)
-            pi, logp_pi = self.model.actor_from_features(features_o_actor)
+                features_o_actor, _, _ = self.model.forward_features(o)
+            pi, logp_pi, _ = self.model.actor_from_features(features_o_actor, None)
             
             qs_pi = [q(features_o_actor, pi) for q in self.model.qs]
             qs_pi_cat = torch.stack(qs_pi, -1)
@@ -574,8 +578,8 @@ class SharedBackboneREDQSACAgent(TrainingAgent):
             if self.learn_entropy_coef:
                 # Need fresh logp_pi for alpha gradient
                 with torch.no_grad():
-                    features_alpha = self.model.forward_features(o)
-                _, logp_pi_alpha = self.model.actor_from_features(features_alpha)
+                    features_alpha, _, _ = self.model.forward_features(o)
+                _, logp_pi_alpha, _ = self.model.actor_from_features(features_alpha, None)
                 loss_alpha = -(self.log_alpha * (logp_pi_alpha + self.target_entropy).detach()).mean()
                 self.alpha_optimizer.zero_grad()
                 loss_alpha.backward()
@@ -644,6 +648,7 @@ class DroQSACAgent(TrainingAgent):
         self.n = 2  # DroQ always uses 2 Q-networks
         self.m = 2  # Use both for min-Q
         self.q_updates_per_policy_update = q_updates_per_policy_update
+        self.alpha_floor = cfg.TMRL_CONFIG.get("ALG", {}).get("ALPHA_FLOOR", 0.08)
 
         model = model if model is not None else model_cls(observation_space, action_space)
         self.model = model.to(device)
@@ -653,6 +658,7 @@ class DroQSACAgent(TrainingAgent):
         self.pi_optimizer = Adam(
             list(self.model.actor.net.parameters()) +
             list(self.model.actor.mu_layer.parameters()) +
+            list(self.model.actor.std_net.parameters()) +
             list(self.model.actor.log_std_layer.parameters()), 
             lr=self.lr_actor
         )
@@ -669,24 +675,29 @@ class DroQSACAgent(TrainingAgent):
 
         self.q_optimizer = Adam(q_params + encoder_params, lr=self.lr_critic)
         
-        self.criterion = torch.nn.MSELoss()
+        # Huber loss is more robust to TD-error spikes than plain MSE while keeping gradients informative.
+        self.criterion = torch.nn.SmoothL1Loss(beta=1.0)
         self.loss_pi = torch.zeros((1,), device=device)
         self.loss_q = torch.zeros((1,), device=device)
         self.i_update = 0
 
+        dim_act = action_space.shape[0]
         if self.target_entropy is None:
-            self.target_entropy = -np.prod(action_space.shape)
+            self.target_entropy = torch.full((dim_act,), -1.0, device=self.device)
         else:
-            self.target_entropy = float(self.target_entropy)
+            per_dim = float(self.target_entropy) / dim_act
+            self.target_entropy = torch.full((dim_act,), per_dim, device=self.device)
 
         if self.learn_entropy_coef:
-            self.log_alpha = torch.log(torch.ones(1, device=self.device) * self.alpha).requires_grad_(True)
+            self.log_alpha = torch.log(torch.ones(dim_act, device=self.device) * self.alpha).requires_grad_(True)
             self.alpha_optimizer = Adam([self.log_alpha], lr=self.lr_entropy)
         else:
-            self.alpha_t = torch.tensor(float(self.alpha)).to(self.device)
+            self.alpha_t = torch.full((dim_act,), float(self.alpha), device=self.device)
 
     def get_actor(self):
-        return self.model_nograd.actor
+        # Avoid deepcopy-based export for DroQ models:
+        # certain parametrized tensors are not deepcopy-compatible in recent torch.
+        return self.model.actor
 
     def train(self, batch):
         """
@@ -697,6 +708,8 @@ class DroQSACAgent(TrainingAgent):
         # Backward compatibility for checkpoints (init logic bypassed)
         if not hasattr(self, "q_updates_per_policy_update"):
              self.q_updates_per_policy_update = cfg.TMRL_CONFIG["ALG"]["REDQ_Q_UPDATES_PER_POLICY_UPDATE"]
+        if not hasattr(self, "alpha_floor"):
+            self.alpha_floor = cfg.TMRL_CONFIG.get("ALG", {}).get("ALPHA_FLOOR", 0.08)
 
         self.i_update += 1
         # DroQ uses high UTD ratio
@@ -728,13 +741,14 @@ class DroQSACAgent(TrainingAgent):
                 fused_o2_tgt, film_o2_tgt, _ = self.model_target.forward_features(o2, ctx)
             else:
                 fused_o2_tgt, film_o2_tgt, _ = self.model_target.forward_features(o2)
-            a2, logp_a2 = self.model_target.actor_from_features(fused_o2_tgt, film_o2_tgt)
+            a2, logp_a2, _ = self.model_target.actor_from_features(fused_o2_tgt, film_o2_tgt)
 
             # Use both Q-networks for min-Q
             q_prediction_next_list = [q(fused_o2_tgt, a2, film_o2_tgt) for q in self.model_target.qs]
             q_prediction_next_cat = torch.stack(q_prediction_next_list, -1)
             min_q, _ = torch.min(q_prediction_next_cat, dim=1, keepdim=True)
-            backup = r.unsqueeze(dim=-1) + self.gamma * (1 - d.unsqueeze(dim=-1)) * (min_q - alpha_t * logp_a2.unsqueeze(dim=-1))
+            alpha_scalar = alpha_t.mean()
+            backup = r.unsqueeze(dim=-1) + self.gamma * (1 - d.unsqueeze(dim=-1)) * (min_q - alpha_scalar * logp_a2.unsqueeze(dim=-1))
 
         # === Critic update (with dropout) ===
         self.model.train()  # Ensure dropout is active
@@ -783,12 +797,13 @@ class DroQSACAgent(TrainingAgent):
                     fused_o_actor, film_o_actor, _ = self.model.forward_features(o, ctx)
                 else:
                     fused_o_actor, film_o_actor, _ = self.model.forward_features(o)
-            pi, logp_pi = self.model.actor_from_features(fused_o_actor, film_o_actor)
+            pi, logp_pi, logp_per_dim = self.model.actor_from_features(fused_o_actor, film_o_actor)
             
             qs_pi = [q(fused_o_actor, pi, film_o_actor) for q in self.model.qs]
             qs_pi_cat = torch.stack(qs_pi, -1)
             min_q_pi = torch.min(qs_pi_cat, dim=1, keepdim=True)[0]
-            loss_pi = (alpha_t * logp_pi.unsqueeze(dim=-1) - min_q_pi).mean()
+            entropy_cost = (alpha_t * logp_per_dim).sum(dim=-1)
+            loss_pi = (entropy_cost.unsqueeze(dim=-1) - min_q_pi).mean()
             
             self.pi_optimizer.zero_grad()
             loss_pi.backward()
@@ -805,12 +820,16 @@ class DroQSACAgent(TrainingAgent):
                         fused_alpha, film_alpha, _ = self.model.forward_features(o, ctx)
                     else:
                         fused_alpha, film_alpha, _ = self.model.forward_features(o)
-                _, logp_pi_alpha = self.model.actor_from_features(fused_alpha, film_alpha)
-                loss_alpha = -(self.log_alpha * (logp_pi_alpha + self.target_entropy).detach()).mean()
+                _, _, logp_per_dim_alpha = self.model.actor_from_features(fused_alpha, film_alpha)
+                loss_alpha = -(self.log_alpha * (logp_per_dim_alpha.detach().mean(dim=0) + self.target_entropy)).sum()
                 self.alpha_optimizer.zero_grad()
                 loss_alpha.backward()
                 torch.nn.utils.clip_grad_norm_(self.log_alpha, 1.0)
                 self.alpha_optimizer.step()
+
+                # Entropy floor: prevent collapse below configured alpha floor.
+                with torch.no_grad():
+                    self.log_alpha.clamp_(min=np.log(self.alpha_floor))
 
             self.loss_pi = loss_pi.detach()
 
@@ -820,13 +839,27 @@ class DroQSACAgent(TrainingAgent):
                 p_targ.data.mul_(self.polyak)
                 p_targ.data.add_((1 - self.polyak) * p.data)
 
+        # Diagnostics: expose alpha and log_std trends to catch entropy collapse early.
+        with torch.no_grad():
+            if uses_context and ctx is not None:
+                fused_diag, film_diag, _ = self.model.forward_features(o, ctx)
+            else:
+                fused_diag, film_diag, _ = self.model.forward_features(o)
+            log_std_raw_diag = self.model.actor.std_net(fused_diag)
+            log_std_diag = core._compute_log_std_smooth(log_std_raw_diag)
+
         ret_dict = dict(
             loss_actor=self.loss_pi.detach().item(),
             loss_critic=self.loss_q.detach().item(),
         )
+        ret_dict["debug_alpha_steer"] = alpha_t[0].item()
+        ret_dict["debug_alpha_gas"] = alpha_t[1].item()
+        ret_dict["debug_alpha_brake"] = alpha_t[2].item()
+        ret_dict["debug_log_std_mean"] = log_std_diag.detach().mean().item()
+        ret_dict["debug_log_std_min"] = log_std_diag.detach().min().item()
 
         if self.learn_entropy_coef and loss_alpha is not None:
             ret_dict["loss_entropy_coef"] = loss_alpha.detach().item()
-            ret_dict["entropy_coef"] = alpha_t.item()
+            ret_dict["entropy_coef"] = alpha_t.mean().item()
 
         return ret_dict
