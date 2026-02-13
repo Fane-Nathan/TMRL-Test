@@ -19,7 +19,7 @@ _File to edit: `tmrl/custom/custom_models.py`_
 LOG_STD_MIN = -20.0
 ```
 
-### [ ] 2. Remove `BatchNorm2d` from the CNN
+### [x] 2. Remove `BatchNorm2d` from the CNN
 
 **Why:** Batch Normalization tracks a running mean/variance. In off-policy RL, the replay buffer distribution constantly shifts, causing the running stats to corrupt the network during `eval()` mode (which is why your deterministic policy scored `-0.405`).
 
@@ -38,7 +38,7 @@ def conv_3x3_bn(inp, oup, stride):
 
 _(Make sure to do this for `conv_1x1_bn` and the `MBConv` class as well)._
 
-### [ ] 3. Disable Dropout in the Context Encoder
+### [x] 3. Disable Dropout in the Context Encoder
 
 **Why:** DroQ relies on dropout _only_ in the Q-heads to estimate uncertainty. Having dropout in the Transformer creates noisy, moving targets for the Bellman equation, preventing the Critic from converging.
 
@@ -60,7 +60,7 @@ _File to edit: `tmrl/custom/custom_models.py`_
 
 **Why:** Because the Actor and Critic share the CNN and Context Encoder, calling `.backward()` on the Actor destroys the representation learned by the Critic. We must block the Actor's gradients from flowing into the shared features.
 
-### [ ] 4. Detach features in `SharedBackboneHybridActorCritic`
+### [x] 4. Detach features in `SharedBackboneHybridActorCritic`
 
 - **Find:** `def actor_from_features(self, features, film=None, test=False, with_logprob=True):`
 - **Change:** Add `.detach()` to the features.
@@ -73,7 +73,7 @@ def actor_from_features(self, features, film=None, test=False, with_logprob=True
     # ... rest of function remains the same
 ```
 
-### [ ] 5. Detach features & FiLM params in `ContextualDroQHybridActorCritic`
+### [x] 5. Detach features & FiLM params in `ContextualDroQHybridActorCritic`
 
 - **Find:** `def actor_from_features(self, fused, film_params, test=False, with_logprob=True):`
 - **Change:** Add `.detach()` to both inputs.
@@ -99,7 +99,7 @@ _File to edit: `hyperparameter_sweep_optuna.py`_
 
 **Why:** Optuna is currently allowed to select combinations that are mathematically guaranteed to fail in non-stationary, high-UTD reinforcement learning. You must restrict the search space.
 
-### [ ] 6. Restrict `GAMMA` (Discount Factor)
+### [x] 6. Restrict `GAMMA` (Discount Factor)
 
 **Why:** TrackMania requires looking far ahead. A gamma of `0.95` only looks ~20 steps ahead.
 
@@ -109,7 +109,7 @@ _File to edit: `hyperparameter_sweep_optuna.py`_
 gamma = trial.suggest_categorical("gamma", [0.99, 0.995, 0.999])
 ```
 
-### [ ] 7. Restrict Adam `beta2`
+### [x] 7. Restrict Adam `beta2`
 
 **Why:** A `beta2` of `0.999` retains too much gradient history, causing explosive update steps when the car hits a new part of the track.
 
@@ -120,7 +120,7 @@ beta2_critic = trial.suggest_categorical("beta2_critic", [0.99, 0.995])
 beta2_actor = trial.suggest_categorical("beta2_actor", [0.99, 0.995])
 ```
 
-### [ ] 8. Cap the UTD (Update-To-Data) Ratio
+### [x] 8. Cap the UTD (Update-To-Data) Ratio
 
 **Why:** Updating the network 20 times per environment step (`20.0`) on a shared backbone will cause severe overfitting to the most recent batch.
 

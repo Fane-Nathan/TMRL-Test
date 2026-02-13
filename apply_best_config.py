@@ -121,6 +121,14 @@ def apply_hyperparams_to_config(
     params: Dict, config: Dict, stability_score: Optional[float] = None
 ) -> Dict:
     """Apply hyperparameters to config."""
+
+    def _normalize_betas(value):
+        if isinstance(value, str):
+            return [float(x.strip()) for x in value.split(",")]
+        if isinstance(value, (list, tuple)):
+            return [float(value[0]), float(value[1])]
+        raise ValueError(f"Unsupported beta format: {value!r}")
+
     new_config = config.copy()
     new_config["ALG"] = config["ALG"].copy()
 
@@ -133,7 +141,6 @@ def apply_hyperparams_to_config(
         "alpha_floor": "ALPHA_FLOOR",
         "gamma": "GAMMA",
         "polyak": "POLYAK",
-        "batch_size": "BATCH_SIZE",
         "l2_actor": "L2_ACTOR",
         "l2_critic": "L2_CRITIC",
         "redq_n": "REDQ_N",
@@ -144,10 +151,28 @@ def apply_hyperparams_to_config(
         if param_key in params:
             new_config["ALG"][config_key] = params[param_key]
 
+    if "batch_size" in params:
+        new_config["BATCH_SIZE"] = params["batch_size"]
+    if "max_training_steps_per_env_step" in params:
+        new_config["MAX_TRAINING_STEPS_PER_ENVIRONMENT_STEP"] = float(
+            params["max_training_steps_per_env_step"]
+        )
+
     if "betas_actor" in params:
-        new_config["ALG"]["BETAS_ACTOR"] = list(params["betas_actor"])
+        new_config["ALG"]["BETAS_ACTOR"] = _normalize_betas(params["betas_actor"])
+    elif "beta1_actor" in params and "beta2_actor" in params:
+        new_config["ALG"]["BETAS_ACTOR"] = [
+            float(params["beta1_actor"]),
+            float(params["beta2_actor"]),
+        ]
+
     if "betas_critic" in params:
-        new_config["ALG"]["BETAS_CRITIC"] = list(params["betas_critic"])
+        new_config["ALG"]["BETAS_CRITIC"] = _normalize_betas(params["betas_critic"])
+    elif "beta1_critic" in params and "beta2_critic" in params:
+        new_config["ALG"]["BETAS_CRITIC"] = [
+            float(params["beta1_critic"]),
+            float(params["beta2_critic"]),
+        ]
 
     new_config["RESET_TRAINING"] = True
 

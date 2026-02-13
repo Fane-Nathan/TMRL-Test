@@ -204,18 +204,22 @@ def create_search_space(trial: optuna.Trial) -> Dict:
     params["alpha_floor"] = trial.suggest_float("alpha_floor", 0.01, 0.2, log=True)
 
     # Stability parameters
-    params["gamma"] = trial.suggest_float("gamma", 0.95, 0.999)
+    params["gamma"] = trial.suggest_categorical("gamma", [0.99, 0.995, 0.999])
     params["polyak"] = trial.suggest_float("polyak", 0.990, 0.999)
     params["batch_size"] = trial.suggest_categorical("batch_size", [128, 256, 512])
+    params["max_training_steps_per_env_step"] = trial.suggest_int(
+        "max_training_steps_per_env_step", 2, 8
+    )
 
     # Regularization - crucial for stability
     params["l2_actor"] = trial.suggest_float("l2_actor", 1e-6, 1e-3, log=True)
     params["l2_critic"] = trial.suggest_float("l2_critic", 1e-6, 1e-3, log=True)
 
-    # Optimizer betas (use strings since Optuna doesn't support tuples)
-    beta_choices = ["0.9,0.999", "0.95,0.999", "0.85,0.995"]
-    params["betas_actor_str"] = trial.suggest_categorical("betas_actor", beta_choices)
-    params["betas_critic_str"] = trial.suggest_categorical("betas_critic", beta_choices)
+    # Optimizer betas
+    params["beta1_actor"] = trial.suggest_categorical("beta1_actor", [0.85, 0.9, 0.95])
+    params["beta2_actor"] = trial.suggest_categorical("beta2_actor", [0.99, 0.995])
+    params["beta1_critic"] = trial.suggest_categorical("beta1_critic", [0.85, 0.9, 0.95])
+    params["beta2_critic"] = trial.suggest_categorical("beta2_critic", [0.99, 0.995])
 
     # REDQ ensemble parameters
     params["redq_n"] = trial.suggest_categorical("redq_n", [2, 4, 8])
@@ -248,15 +252,13 @@ def apply_hyperparameters_to_config(params: Dict, base_config: Dict) -> Dict:
     config["ALG"]["GAMMA"] = params["gamma"]
     config["ALG"]["POLYAK"] = params["polyak"]
     config["BATCH_SIZE"] = params["batch_size"]
+    config["MAX_TRAINING_STEPS_PER_ENVIRONMENT_STEP"] = float(
+        params["max_training_steps_per_env_step"]
+    )
     config["ALG"]["L2_ACTOR"] = params["l2_actor"]
     config["ALG"]["L2_CRITIC"] = params["l2_critic"]
-    # Parse betas from strings
-    config["ALG"]["BETAS_ACTOR"] = [
-        float(x) for x in params["betas_actor_str"].split(",")
-    ]
-    config["ALG"]["BETAS_CRITIC"] = [
-        float(x) for x in params["betas_critic_str"].split(",")
-    ]
+    config["ALG"]["BETAS_ACTOR"] = [params["beta1_actor"], params["beta2_actor"]]
+    config["ALG"]["BETAS_CRITIC"] = [params["beta1_critic"], params["beta2_critic"]]
     config["ALG"]["REDQ_N"] = params["redq_n"]
     config["ALG"]["REDQ_M"] = params["redq_m"]
 

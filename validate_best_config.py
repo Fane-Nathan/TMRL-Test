@@ -72,6 +72,14 @@ def create_validation_config(
     params: Dict, base_config: Dict, run_name: str, epochs: int
 ) -> Dict:
     """Create validation configuration from hyperparameters."""
+
+    def _normalize_betas(value):
+        if isinstance(value, str):
+            return [float(x.strip()) for x in value.split(",")]
+        if isinstance(value, (list, tuple)):
+            return [float(value[0]), float(value[1])]
+        raise ValueError(f"Unsupported beta format: {value!r}")
+
     config = base_config.copy()
     config["ALG"] = base_config["ALG"].copy()
 
@@ -88,10 +96,26 @@ def create_validation_config(
     config["ALG"]["GAMMA"] = params["gamma"]
     config["ALG"]["POLYAK"] = params["polyak"]
     config["BATCH_SIZE"] = params["batch_size"]
+    if "max_training_steps_per_env_step" in params:
+        config["MAX_TRAINING_STEPS_PER_ENVIRONMENT_STEP"] = float(
+            params["max_training_steps_per_env_step"]
+        )
     config["ALG"]["L2_ACTOR"] = params["l2_actor"]
     config["ALG"]["L2_CRITIC"] = params["l2_critic"]
-    config["ALG"]["BETAS_ACTOR"] = list(params["betas_actor"])
-    config["ALG"]["BETAS_CRITIC"] = list(params["betas_critic"])
+    if "betas_actor" in params:
+        config["ALG"]["BETAS_ACTOR"] = _normalize_betas(params["betas_actor"])
+    else:
+        config["ALG"]["BETAS_ACTOR"] = [
+            float(params["beta1_actor"]),
+            float(params["beta2_actor"]),
+        ]
+    if "betas_critic" in params:
+        config["ALG"]["BETAS_CRITIC"] = _normalize_betas(params["betas_critic"])
+    else:
+        config["ALG"]["BETAS_CRITIC"] = [
+            float(params["beta1_critic"]),
+            float(params["beta2_critic"]),
+        ]
     config["ALG"]["REDQ_N"] = params["redq_n"]
     config["ALG"]["REDQ_M"] = params["redq_m"]
 

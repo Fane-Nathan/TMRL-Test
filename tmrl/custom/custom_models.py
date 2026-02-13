@@ -248,7 +248,7 @@ class SELayer(nn.Module):
 def conv_3x3_bn(inp, oup, stride):
     return nn.Sequential(
         nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
-        nn.BatchNorm2d(oup),
+        nn.GroupNorm(num_groups=1, num_channels=oup),
         SiLU()
     )
 
@@ -256,7 +256,7 @@ def conv_3x3_bn(inp, oup, stride):
 def conv_1x1_bn(inp, oup):
     return nn.Sequential(
         nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
-        nn.BatchNorm2d(oup),
+        nn.GroupNorm(num_groups=1, num_channels=oup),
         SiLU()
     )
 
@@ -272,26 +272,26 @@ class MBConv(nn.Module):
             self.conv = nn.Sequential(
                 # pw
                 nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False),
-                nn.BatchNorm2d(hidden_dim),
+                nn.GroupNorm(num_groups=1, num_channels=hidden_dim),
                 SiLU(),
                 # dw
                 nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
-                nn.BatchNorm2d(hidden_dim),
+                nn.GroupNorm(num_groups=1, num_channels=hidden_dim),
                 SiLU(),
                 SELayer(inp, hidden_dim),
                 # pw-linear
                 nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
-                nn.BatchNorm2d(oup),
+                nn.GroupNorm(num_groups=1, num_channels=oup),
             )
         else:
             self.conv = nn.Sequential(
                 # fused
                 nn.Conv2d(inp, hidden_dim, 3, stride, 1, bias=False),
-                nn.BatchNorm2d(hidden_dim),
+                nn.GroupNorm(num_groups=1, num_channels=hidden_dim),
                 SiLU(),
                 # pw-linear
                 nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
-                nn.BatchNorm2d(oup),
+                nn.GroupNorm(num_groups=1, num_channels=oup),
             )
 
     def forward(self, x):
@@ -1016,6 +1016,7 @@ class SharedBackboneHybridActorCritic(nn.Module):
     def actor_from_features(self, features, film=None, test=False, with_logprob=True):
         """Compute action from pre-extracted features."""
         del film
+        features = features.detach()
         net_out = self.actor.net(features)
         mu = self.actor.mu_layer(net_out)
         log_std_raw = self.actor.std_net(features)
@@ -1237,13 +1238,13 @@ class ContextEncoder(nn.Module):
         # norm_first=True (Pre-LN) is crucial for RL gradient flow stability
         state_layer = nn.TransformerEncoderLayer(
             d_model=enriched_dim, nhead=4, dim_feedforward=128,
-            dropout=0.1, batch_first=True, norm_first=True
+            dropout=0.0, batch_first=True, norm_first=True
         )
         self.state_transformer = nn.TransformerEncoder(state_layer, num_layers=2)
 
         action_layer = nn.TransformerEncoderLayer(
             d_model=enriched_dim, nhead=4, dim_feedforward=128,
-            dropout=0.1, batch_first=True, norm_first=True
+            dropout=0.0, batch_first=True, norm_first=True
         )
         self.action_transformer = nn.TransformerEncoder(action_layer, num_layers=2)
 
@@ -1650,6 +1651,9 @@ class ContextualDroQHybridActorCritic(nn.Module):
 
     def actor_from_features(self, fused, film_params, test=False, with_logprob=True):
         """Compute action from fused features + FiLM params."""
+        fused = fused.detach()
+        if film_params is not None:
+            film_params = [(gamma.detach(), beta.detach()) for gamma, beta in film_params]
         net_out = self.actor.net(fused, film_params)  # FiLM-modulated actor MLP
         mu = self.actor.mu_layer(net_out)
         log_std_raw = self.actor.std_net(fused)
