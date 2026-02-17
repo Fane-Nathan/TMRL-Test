@@ -656,22 +656,24 @@ class MemoryTMHybrid(MemoryTM):
         info = self.data[6][idx_now]
 
         # === Build context window for Context Encoder ===
-        # Context: K=16 recent transitions before idx_last
+        # Build K+1 steps so trainer can use:
+        # - ctx      = context[:-1]  (ends at t)
+        # - ctx_next = context[1:]   (ends at t+1)
         # Each step: speed(1) + lidar(19) + action(3) + reward(1) = 24
         K = 16
-        context = np.zeros((K, 24), dtype=np.float32)
+        context = np.zeros((K + 1, 24), dtype=np.float32)
         total_data_len = len(self.data[0])
-        for k in range(K):
-            ctx_idx = idx_last - K + k  # indices [idx_last-K, ..., idx_last-1]
+        for k in range(K + 1):
+            ctx_idx = idx_now - K + k
             if ctx_idx < 0 or ctx_idx >= total_data_len:
                 continue  # leave as zeros (padding)
-            # Check episode boundary: if there's an EOE between ctx_idx and idx_last, zero-pad
-            if self.data[4][ctx_idx]:
-                # This index is an EOE, zero out everything before it
-                for j in range(k):
-                    context[j] = 0.0
+
+            # If this is an EOE from a previous episode token, wipe prefix.
+            # Keep k == K intact so target (t+1) can still use its own terminal context.
+            if self.data[4][ctx_idx] and k < K:
+                context[:k + 1] = 0.0
                 continue
-            # Use .reshape(-1)[-1] to handle both scalars and history sequences robustly
+
             spd = np.float32(self.data[2][ctx_idx]).reshape(-1)[-1]
             lid = np.array(self.data[11][ctx_idx], dtype=np.float32).flatten()
             act_ctx = np.array(self.data[1][ctx_idx], dtype=np.float32).flatten()

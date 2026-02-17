@@ -413,10 +413,11 @@ class REDQSACAgent(TrainingAgent):
         if update_policy:
             self.pi_optimizer.step()
 
-        with torch.no_grad():
-            for p, p_targ in zip(self.model.parameters(), self.model_target.parameters()):
-                p_targ.data.mul_(self.polyak)
-                p_targ.data.add_((1 - self.polyak) * p.data)
+        if update_policy:
+            with torch.no_grad():
+                for p, p_targ in zip(self.model.parameters(), self.model_target.parameters()):
+                    p_targ.data.mul_(self.polyak)
+                    p_targ.data.add_((1 - self.polyak) * p.data)
 
         if update_policy:
             self.loss_pi = loss_pi.detach()
@@ -425,7 +426,7 @@ class REDQSACAgent(TrainingAgent):
             loss_critic=loss_q.detach().item(),
         )
 
-        if self.learn_entropy_coef:
+        if self.learn_entropy_coef and loss_alpha is not None:
             ret_dict["loss_entropy_coef"] = loss_alpha.detach().item()
             ret_dict["entropy_coef"] = alpha_t.item()
 
@@ -480,18 +481,24 @@ class SharedBackboneREDQSACAgent(TrainingAgent):
         )
         
         # Optimizer for Q-heads AND Encoder (Critic drives representation)
-        q_params = [p for q in self.model.qs for p in q.parameters()]
-        encoder_params = list(self.model.actor.cnn.parameters()) + list(self.model.actor.float_mlp.parameters())
+        self._q_params = [p for q in self.model.qs for p in q.parameters()]
+        self._encoder_params = list(self.model.actor.cnn.parameters()) + list(self.model.actor.float_mlp.parameters())
         if hasattr(self.model.actor, "fusion_norm"):
-            encoder_params += list(self.model.actor.fusion_norm.parameters())
+            self._encoder_params += list(self.model.actor.fusion_norm.parameters())
         if hasattr(self.model.actor, "fusion_gate"):
-            encoder_params += list(self.model.actor.fusion_gate.parameters())
+            self._encoder_params += list(self.model.actor.fusion_gate.parameters())
         if hasattr(self.model.actor, "context_encoder"):
-            encoder_params += list(self.model.actor.context_encoder.parameters())
+            self._encoder_params += list(self.model.actor.context_encoder.parameters())
         if hasattr(self.model.actor, "film_generator"):
-            encoder_params += list(self.model.actor.film_generator.parameters())
+            self._encoder_params += list(self.model.actor.film_generator.parameters())
 
-        self.q_optimizer = Adam(q_params + encoder_params, lr=self.lr_critic)
+        # Keep shared representation updates slower than Q-head updates at high UTD.
+        utd_ratio = max(1.0, float(self.q_updates_per_policy_update))
+        encoder_lr = self.lr_critic / utd_ratio
+        self.q_optimizer = Adam([
+            {'params': self._q_params, 'lr': self.lr_critic},
+            {'params': self._encoder_params, 'lr': encoder_lr},
+        ])
         
         self.criterion = torch.nn.MSELoss()
         self.loss_pi = torch.zeros((1,), device=device)
@@ -526,9 +533,12 @@ class SharedBackboneREDQSACAgent(TrainingAgent):
 
         # === Target Q computation (with no_grad) ===
         with torch.no_grad():
-            # Extract features for next obs from TARGET network
+            # Use current policy for next action, target critics for evaluation.
+            features_o2_curr, _, _ = self.model.forward_features(o2)
+            a2, logp_a2, _ = self.model.actor_from_features(features_o2_curr, None)
+
+            # Extract target features for target Q-values
             features_o2_target, _, _ = self.model_target.forward_features(o2)
-            a2, logp_a2, _ = self.model_target.actor_from_features(features_o2_target, None)
 
             sample_idxs = np.random.choice(self.n, self.m, replace=False)
             q_prediction_next_list = [self.model_target.qs[i](features_o2_target, a2) for i in sample_idxs]
@@ -588,10 +598,11 @@ class SharedBackboneREDQSACAgent(TrainingAgent):
             self.loss_pi = loss_pi.detach()
 
         # === Polyak averaging ===
-        with torch.no_grad():
-            for p, p_targ in zip(self.model.parameters(), self.model_target.parameters()):
-                p_targ.data.mul_(self.polyak)
-                p_targ.data.add_((1 - self.polyak) * p.data)
+        if update_policy:
+            with torch.no_grad():
+                for p, p_targ in zip(self.model.parameters(), self.model_target.parameters()):
+                    p_targ.data.mul_(self.polyak)
+                    p_targ.data.add_((1 - self.polyak) * p.data)
 
         ret_dict = dict(
             loss_actor=self.loss_pi.detach().item(),
@@ -655,28 +666,47 @@ class DroQSACAgent(TrainingAgent):
         self.model_target = no_grad(deepcopy(self.model))
         
         # Optimizer for actor's policy head only (features are fixed/detached for actor)
-        self.pi_optimizer = Adam(
-            list(self.model.actor.net.parameters()) +
-            list(self.model.actor.mu_layer.parameters()) +
-            list(self.model.actor.std_net.parameters()) +
-            list(self.model.actor.log_std_layer.parameters()), 
-            lr=self.lr_actor
-        )
+        self.pi_optimizer = Adam([
+            {'params': list(self.model.actor.net.parameters()) +
+                       list(self.model.actor.mu_layer.parameters()),
+             'lr': self.lr_actor},
+            {'params': list(self.model.actor.std_net.parameters()) +
+                       (list(self.model.actor.log_std_layer.parameters())
+                        if hasattr(self.model.actor, 'log_std_layer') else []),
+             'lr': self.lr_actor},
+        ], lr=self.lr_actor)
         
         # Optimizer for Q-heads AND Encoder (Critic drives representation)
-        q_params = [p for q in self.model.qs for p in q.parameters()]
-        encoder_params = list(self.model.actor.cnn.parameters()) + list(self.model.actor.float_mlp.parameters())
+        # Context encoder gets a lower LR because Q-loss gradients travel through
+        # ~15 layers to reach it, becoming noisy. A lower LR prevents noise amplification.
+        self._q_params = [p for q in self.model.qs for p in q.parameters()]
+        self._encoder_params = list(self.model.actor.cnn.parameters()) + list(self.model.actor.float_mlp.parameters())
         if hasattr(self.model.actor, "fusion_norm"):
-            encoder_params += list(self.model.actor.fusion_norm.parameters())
+            self._encoder_params += list(self.model.actor.fusion_norm.parameters())
         if hasattr(self.model.actor, "fusion_gate"):
-            encoder_params += list(self.model.actor.fusion_gate.parameters())
-        if hasattr(self.model.actor, "context_encoder"):
-            encoder_params += list(self.model.actor.context_encoder.parameters())
-
-        self.q_optimizer = Adam(q_params + encoder_params, lr=self.lr_critic)
+            self._encoder_params += list(self.model.actor.fusion_gate.parameters())
         
-        # Huber loss is more robust to TD-error spikes than plain MSE while keeping gradients informative.
-        self.criterion = torch.nn.SmoothL1Loss(beta=1.0)
+        self._context_params = []
+        if hasattr(self.model.actor, "context_encoder"):
+            self._context_params = list(self.model.actor.context_encoder.parameters())
+        if hasattr(self.model.actor, "film_generator"):
+            self._context_params += list(self.model.actor.film_generator.parameters())
+
+        # Scale encoder-related learning rates by UTD to prevent representation churn.
+        utd_ratio = max(1.0, float(self.q_updates_per_policy_update))
+        encoder_lr = self.lr_critic / utd_ratio
+        context_lr = (self.lr_critic * 0.1) / utd_ratio
+
+        optimizer_groups = [
+            {'params': self._q_params, 'lr': self.lr_critic},
+            {'params': self._encoder_params, 'lr': encoder_lr},
+        ]
+        if self._context_params:
+            optimizer_groups.append({'params': self._context_params, 'lr': context_lr})
+        self.q_optimizer = Adam(optimizer_groups)
+        
+        # Use MSELoss so critics can aggressively correct large Q-target errors.
+        self.criterion = torch.nn.MSELoss()
         self.loss_pi = torch.zeros((1,), device=device)
         self.loss_q = torch.zeros((1,), device=device)
         self.i_update = 0
@@ -717,10 +747,16 @@ class DroQSACAgent(TrainingAgent):
 
         # Unpack batch - support context-augmented (7 elements) and standard (6 elements)
         if len(batch) == 7:
-            o, a, r, o2, d, _, ctx = batch
+            o, a, r, o2, d, _, ctx_full = batch
+            # Replay stores K+1 context steps so we can align Bellman targets.
+            # ctx      ends at t,      used with o
+            # ctx_next ends at t + 1,  used with o2
+            ctx = ctx_full[:, :-1, :]
+            ctx_next = ctx_full[:, 1:, :]
         else:
             o, a, r, o2, d, _ = batch
             ctx = None
+            ctx_next = None
 
         # Ensure Q-networks are in training mode (dropout active)
         self.model.train()
@@ -737,11 +773,21 @@ class DroQSACAgent(TrainingAgent):
         # === Target Q computation (with no_grad, dropout disabled) ===
         with torch.no_grad():
             self.model_target.eval()  # Disable dropout for target
-            if uses_context and ctx is not None:
-                fused_o2_tgt, film_o2_tgt, _ = self.model_target.forward_features(o2, ctx)
+            self.model.eval()         # BUG 1 FIX: Disable dropout for current policy
+            
+            # BUG 1 FIX: Use CURRENT policy to get next action a2
+            if uses_context and ctx_next is not None:
+                fused_o2_curr, film_o2_curr, _ = self.model.forward_features(o2, ctx_next)
+            else:
+                fused_o2_curr, film_o2_curr, _ = self.model.forward_features(o2)
+            a2, logp_a2, _ = self.model.actor_from_features(fused_o2_curr, film_o2_curr)
+            self.model.train()        # Re-enable dropout
+
+            # Now evaluate the Q-value of that action using the TARGET network
+            if uses_context and ctx_next is not None:
+                fused_o2_tgt, film_o2_tgt, _ = self.model_target.forward_features(o2, ctx_next)
             else:
                 fused_o2_tgt, film_o2_tgt, _ = self.model_target.forward_features(o2)
-            a2, logp_a2, _ = self.model_target.actor_from_features(fused_o2_tgt, film_o2_tgt)
 
             # Use both Q-networks for min-Q
             q_prediction_next_list = [q(fused_o2_tgt, a2, film_o2_tgt) for q in self.model_target.qs]
@@ -783,7 +829,12 @@ class DroQSACAgent(TrainingAgent):
 
         self.q_optimizer.zero_grad()
         loss_q.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        # Per-module gradient clipping: context encoder gets tighter clip
+        # because its gradients traveled through 15+ layers and are noisy
+        torch.nn.utils.clip_grad_norm_(self._q_params, 1.0)
+        torch.nn.utils.clip_grad_norm_(self._encoder_params, 1.0)
+        if self._context_params:
+            torch.nn.utils.clip_grad_norm_(self._context_params, 0.5)
         self.q_optimizer.step()
 
         # === Actor update ===
@@ -807,7 +858,12 @@ class DroQSACAgent(TrainingAgent):
             
             self.pi_optimizer.zero_grad()
             loss_pi.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            # Per-module clipping for actor: std_net gets tighter clip
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.actor.net.parameters()) +
+                list(self.model.actor.mu_layer.parameters()), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.actor.std_net.parameters()), 0.5)
             self.pi_optimizer.step()
 
             for q in self.model.qs:
@@ -834,10 +890,11 @@ class DroQSACAgent(TrainingAgent):
             self.loss_pi = loss_pi.detach()
 
         # === Polyak averaging ===
-        with torch.no_grad():
-            for p, p_targ in zip(self.model.parameters(), self.model_target.parameters()):
-                p_targ.data.mul_(self.polyak)
-                p_targ.data.add_((1 - self.polyak) * p.data)
+        if update_policy:  # BUG 2 FIX: Only update target networks when policy updates!
+            with torch.no_grad():
+                for p, p_targ in zip(self.model.parameters(), self.model_target.parameters()):
+                    p_targ.data.mul_(self.polyak)
+                    p_targ.data.add_((1 - self.polyak) * p.data)
 
         # Diagnostics: expose alpha and log_std trends to catch entropy collapse early.
         with torch.no_grad():

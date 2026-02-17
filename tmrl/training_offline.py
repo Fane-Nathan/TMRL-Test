@@ -196,6 +196,7 @@ class TrainingOffline:
         logging.info(f" CSV logging to: {csv_path}")
 
     def _ensure_stall_tracking_state(self):
+        alg_cfg = cfg.TMRL_CONFIG.get("ALG", {})
         # Backward-compatible defaults for older checkpoints.
         if not hasattr(self, "_eval_epoch_returns"):
             self._eval_epoch_returns = []
@@ -206,11 +207,11 @@ class TrainingOffline:
         if not hasattr(self, "_stall_epochs"):
             self._stall_epochs = 0
         if not hasattr(self, "_stall_improvement_threshold"):
-            self._stall_improvement_threshold = 0.05
+            self._stall_improvement_threshold = float(alg_cfg.get("STALL_IMPROVEMENT_THRESHOLD", 0.05))
         if not hasattr(self, "_stall_patience"):
-            self._stall_patience = 10
+            self._stall_patience = int(alg_cfg.get("STALL_PATIENCE", 10))
         if not hasattr(self, "_stall_warning_epochs"):
-            self._stall_warning_epochs = 5
+            self._stall_warning_epochs = int(alg_cfg.get("STALL_WARNING_EPOCHS", 5))
         if not hasattr(self, "_stall_last_auto_action"):
             self._stall_last_auto_action = "none"
         if not hasattr(self, "_stall_last_action_epoch"):
@@ -220,8 +221,14 @@ class TrainingOffline:
         """
         Applies safe, bounded auto-recovery actions when stalled.
         """
+        return "none"  # <--- SABOTEUR DISABLED
         action_parts = []
-        if not stall_state.get("stalled", False):
+        stall_epochs = int(stall_state.get("stall_epochs", 0))
+        warning_epochs = int(getattr(self, "_stall_warning_epochs", 5))
+        patience = int(stall_state.get("patience", 10))
+
+        # Apply no mutation while healthy.
+        if stall_epochs < warning_epochs:
             self._stall_last_auto_action = "none"
             return "none"
 
@@ -229,10 +236,16 @@ class TrainingOffline:
         if self._stall_last_action_epoch == self.epoch:
             return self._stall_last_auto_action
 
-        # 1) Reduce UTD pressure when stalled.
+        # Escalate recovery strength when fully stalled.
+        hard_stall = stall_epochs >= patience
+        utd_step = 2 if hard_stall else 1
+        alpha_step = 0.02 if hard_stall else 0.01
+        alpha_cap = 0.12 if hard_stall else 0.08
+
+        # 1) Reduce UTD pressure.
         if hasattr(self.agent, "q_updates_per_policy_update"):
             old_utd = int(self.agent.q_updates_per_policy_update)
-            new_utd = max(8, old_utd - 2)
+            new_utd = max(1, old_utd - utd_step)
             if new_utd != old_utd:
                 self.agent.q_updates_per_policy_update = new_utd
                 action_parts.append(f"utd:{old_utd}->{new_utd}")
@@ -240,12 +253,13 @@ class TrainingOffline:
         # 2) Raise entropy floor slightly to recover exploration.
         if hasattr(self.agent, "alpha_floor"):
             old_floor = float(self.agent.alpha_floor)
-            new_floor = min(0.12, old_floor + 0.02)
+            new_floor = min(alpha_cap, old_floor + alpha_step)
             if abs(new_floor - old_floor) > 1e-12:
                 self.agent.alpha_floor = new_floor
                 action_parts.append(f"alpha_floor:{old_floor:.3f}->{new_floor:.3f}")
 
-        action = ",".join(action_parts) if action_parts else "hold(stalled,no_change)"
+        mode = "stalled" if hard_stall else "warning"
+        action = ",".join(action_parts) if action_parts else f"hold({mode},no_change)"
         self._stall_last_auto_action = action
         self._stall_last_action_epoch = self.epoch
         return action
@@ -287,7 +301,16 @@ class TrainingOffline:
             )
             return
 
-        eval_epoch_return = float(sum(float(s.get("return_test", 0.0)) for s in epoch_stats) / len(epoch_stats))
+        eval_mode = str(getattr(cfg, "TEST_EVAL_MODE", "dual")).lower()
+        eval_epoch_return_det = float(sum(float(s.get("return_test_det", s.get("return_test", 0.0))) for s in epoch_stats) / len(epoch_stats))
+        eval_epoch_return_stoch = float(sum(float(s.get("return_test_stoch", s.get("return_test", 0.0))) for s in epoch_stats) / len(epoch_stats))
+        if eval_mode == "deterministic":
+            eval_epoch_return = eval_epoch_return_det
+        elif eval_mode == "stochastic":
+            eval_epoch_return = eval_epoch_return_stoch
+        else:
+            # In dual mode, we track both exploitation quality and exploratory quality.
+            eval_epoch_return = 0.5 * (eval_epoch_return_det + eval_epoch_return_stoch)
         self._eval_epoch_returns.append(eval_epoch_return)
 
         state = compute_stall_state(
@@ -305,7 +328,10 @@ class TrainingOffline:
 
         payload = {
             "epoch": int(self.epoch),
+            "eval_mode": eval_mode,
             "eval_epoch_return": eval_epoch_return,
+            "eval_epoch_return_det": eval_epoch_return_det,
+            "eval_epoch_return_stoch": eval_epoch_return_stoch,
             "train_epoch_return": train_epoch_return,
             "eval_return_ma10": state["eval_return_ma10"],
             "train_return_ma10": state["train_return_ma10"],
@@ -323,7 +349,7 @@ class TrainingOffline:
             json.dump(payload, f, indent=2, sort_keys=True)
 
         logging.info(
-            f" Stall diagnostics: eval_return_ma10={state['eval_return_ma10']:.6f}, "
+            f" Stall diagnostics: eval_mode={eval_mode}, eval_return_ma10={state['eval_return_ma10']:.6f}, "
             f"train_return_ma10={state['train_return_ma10']:.6f}, "
             f"stalled={state['stalled']}, stall_epochs={state['stall_epochs']}"
         )

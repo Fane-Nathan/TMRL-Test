@@ -51,14 +51,14 @@ def obs_preprocessor_tm_hybrid(obs):
     speed, gear, rpm, images, lidar, act1, act2 = obs
 
     # Normalize images (0-255 -> 0.0-1.0) for the CNN
-    images = images.astype(np.float32) / 255.0
+    images = images.astype(np.float32) / 256.0
 
     # Normalize float inputs
     speed = speed / 1000.0
     gear = gear / 10.0
     rpm = rpm / 10000.0
 
-    # Ensure lidar is flat and normalized
-    lidar = np.ndarray.flatten(lidar).astype(np.float32) / 300.0
+    # Ensure lidar is flat and normalized (clipped to [0,1] to prevent overflow)
+    lidar = np.clip(np.ndarray.flatten(lidar).astype(np.float32) / 300.0, 0.0, 1.0)
 
     return (speed, gear, rpm, images, lidar, act1, act2)

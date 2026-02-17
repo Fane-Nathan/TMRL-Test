@@ -59,6 +59,9 @@ def _squashed_gaussian_logprob(pi_distribution, pi_action):
     logp_per_dim = pi_distribution.log_prob(pi_action)
     tanh_correction = 2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))
     logp_per_dim = logp_per_dim - tanh_correction
+
+    # Keep gradients intact for entropy/actor updates (no hard clamp here).
+
     logp_total = logp_per_dim.sum(dim=-1)
     return logp_total, logp_per_dim
 
@@ -937,6 +940,8 @@ class SharedBackboneHybridActor(TorchActorModule):
             nn.SiLU(),
             nn.Linear(64, dim_act)
         )
+        # Fix 6: Initialize bias to 1.0 -> tanh(0.97) -> log_std ~ -0.7 -> std ~ 0.5
+        nn.init.constant_(self.std_net[-1].bias, 1.0)
         self.act_limit = act_limit
 
     def forward(self, obs, test=False, with_logprob=True):
@@ -949,10 +954,8 @@ class SharedBackboneHybridActor(TorchActorModule):
         combined = torch.cat((img_embed, float_embed), dim=-1)
         features = self.fusion_norm(combined)
 
-        # Policy
-        net_out = self.net(features)
-
         # Policy head - DECOUPLED mu/std
+        net_out = self.net(features)
         mu = self.mu_layer(net_out)
         log_std_raw = self.std_net(features)
         log_std = _compute_log_std_smooth(log_std_raw)
@@ -1197,6 +1200,8 @@ class FusionGate(nn.Module):
         img_proj = self.img_proj(img_embed)
         float_proj = self.float_proj(float_embed)
         gate = self.gate_net(torch.cat((img_embed, float_embed), dim=-1))
+        # Keep both modalities active to preserve gradient flow.
+        gate = torch.clamp(gate, min=0.1, max=0.9)
         fused = gate * img_proj + (1.0 - gate) * float_proj
         return self.norm(fused)
 
@@ -1305,6 +1310,8 @@ class ContextEncoder(nn.Module):
         action_out = action_out + action_seq
 
         gate = self.stream_gate(torch.cat([state_out, action_out], dim=-1))
+        # Keep both streams active to preserve gradient flow.
+        gate = torch.clamp(gate, min=0.1, max=0.9)
         transformed = gate * state_out + (1 - gate) * action_out
 
         self.gru.flatten_parameters()
@@ -1335,15 +1342,17 @@ class ContextEncoder(nn.Module):
         We now buffer the last K steps and run the FULL Transformer.
         This guarantees Mathematically Exact consistency between Training and Gameplay.
         """
-        # 1. Update Buffer
+        # 1. Initialize fixed-size zero window to match training-time left padding.
         if self._window_buffer is None:
-            self._window_buffer = context_step.unsqueeze(1) # (1, 1, 24)
-        else:
-            self._window_buffer = torch.cat([self._window_buffer, context_step.unsqueeze(1)], dim=1)
-        
-        # 2. Trim Buffer (Keep fixed window size)
-        if self._window_buffer.shape[1] > self.max_len:
-            self._window_buffer = self._window_buffer[:, -self.max_len:, :]
+            self._window_buffer = torch.zeros(
+                (context_step.shape[0], self.max_len, context_step.shape[-1]),
+                device=context_step.device,
+                dtype=context_step.dtype,
+            )
+
+        # 2. Shift left and append latest context token.
+        self._window_buffer = torch.roll(self._window_buffer, shifts=-1, dims=1)
+        self._window_buffer[:, -1, :] = context_step
 
         # 3. Run Full Forward Pass (Robust)
         # We call forward() directly. It handles masking and deltas.
@@ -1372,12 +1381,7 @@ class FiLMGenerator(nn.Module):
         # Initialize so FiLM starts as identity: γ=1, β=0
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
-        # Set γ bias to 1 (so initial modulation is identity)
-        with torch.no_grad():
-            for i in range(self.n_layers):
-                start = i * self.hidden_dim * 2
-                # Only fill the 'gamma' half of each layer's chunk with 1.0
-                self.net[-1].bias[start : start + self.hidden_dim].fill_(1.0)
+        # Bounded gamma transform maps zero raw output to identity (gamma = 1.0).
 
     def forward(self, z):
         """
@@ -1391,8 +1395,9 @@ class FiLMGenerator(nn.Module):
         params = []
         for i in range(self.n_layers):
             start = i * self.hidden_dim * 2
-            gamma = raw[:, start:start + self.hidden_dim]
+            gamma_raw = raw[:, start:start + self.hidden_dim]
             beta = raw[:, start + self.hidden_dim:start + self.hidden_dim * 2]
+            gamma = 1.0 + 0.5 * torch.tanh(gamma_raw)
             params.append((gamma, beta))
         return params
 
@@ -1506,6 +1511,8 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
             nn.SiLU(),
             nn.Linear(64, dim_act)
         )
+        # Fix 6: Initialize bias to 1.0 -> tanh(0.97) -> log_std ~ -0.7 -> std ~ 0.5
+        nn.init.constant_(self.std_net[-1].bias, 1.0)
         self.act_limit = act_limit
         # Previous reward from worker-side rollout for online context alignment.
         self._online_prev_reward = 0.0

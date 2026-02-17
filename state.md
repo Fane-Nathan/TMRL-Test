@@ -126,6 +126,10 @@ beta2_actor = trial.suggest_categorical("beta2_actor", [0.99, 0.995])
 
 - **Fix:** Lower the maximum training steps per environment step to a safer range (e.g., 2 to 8).
 
+**Why:** Updating the network 20 times per environment step (`20.0`) on a shared backbone will cause severe overfitting to the most recent batch.
+
+- **Fix:** Lower the maximum training steps per environment step to a safer range (e.g., 2 to 8).
+
 ```python
 max_training_steps_per_env_step = trial.suggest_int("max_training_steps_per_env_step", 2, 8)
 ```
@@ -134,10 +138,45 @@ max_training_steps_per_env_step = trial.suggest_int("max_training_steps_per_env_
 
 ## Phase 4: Restart Protocol
 
-Once these code changes are implemented, your previous replay buffers and Optuna trials are mathematically poisoned with data from the old, unstable architecture.
+**CRITICAL DIAGNOSIS (Epoch 4 Explosion):**
+The "Explosion" (Actor Loss ~300, Q-Values ~-300) confirms that your **Replay Buffer is poisoned** with data from the old, unstable architecture. The Q-function has converged to a pessimistic "crash" value (-300) because the buffer is dominated by old failures. The stochastic policy gets lucky (+10 return) via noise, but the deterministic policy (-0.4 return) follows the pessimistic Q-function into a wall.
 
-- [ ] **Wipe Optuna Database:** Delete your `study_database.db` (or whatever your Optuna sqlite file is named) so the hyperparameter search doesn't try to learn from the collapsed runs.
-- [ ] **Clear Replay Buffers:** Empty your TMRL replay memory folders (delete `.pkl` files). The old data contains thousands of high-speed wobbles/crashes caused by the `LOG_STD_MIN = -2` bug.
-- [ ] **Restart Training:** Launch your sweep again.
+**You MUST clear the old data.**
+
+- [ ] **STOP TRAINING IMMEDIATELY**: This run is unrecoverable.
+- [ ] **Wipe Optuna Database**: Delete `TmrlData/hyperparameter_results/study_database.db`.
+- [ ] **Clear Replay Buffers**: Delete all `.pkl` files in `TmrlData/dataset/` and `TmrlData/reward/`.
+- [ ] **Clear Checkpoints**: Delete all files in `TmrlData/checkpoints/` and `TmrlData/weights/`.
+- [ ] **Restart Training**: Launch `python hyperparameter_sweep_optuna.py ...` fresh.
 
 With these fixes, your deterministic policy will actually start driving, your actor loss will remain flat/stable, and the agent will be able to sustain training for 50+ epochs without catastrophic collapse!
+
+---
+
+## Phase 6: The Gradient Deadzone and Loss Function Throttling
+
+**Diagnosis recap:** Late-stage collapse (short episodes + rising critic loss) was consistent with two coupled issues:
+
+- A hard clamp on `logp_per_dim` in `_squashed_gaussian_logprob` created boundary deadzones (zero gradient at clamp limits), weakening actor/entropy adaptation.
+- `SmoothL1Loss` in `DroQSACAgent` reduced correction strength for large TD errors when critic targets needed fast re-scaling.
+
+### [x] 1. Remove Entropy Gradient Deadzone
+
+_File edited: `tmrl/custom/custom_models.py`_
+
+- Removed `torch.clamp(logp_per_dim, min=-5.0, max=5.0)` from `_squashed_gaussian_logprob`.
+- Restored unconstrained squashed-Gaussian log-prob correction so gradients can flow through large-action regimes.
+
+### [x] 2. Restore Full Critic Error Correction
+
+_File edited: `tmrl/custom/custom_algorithms.py`_
+
+- In `DroQSACAgent.__init__`, changed:
+  - `self.criterion = torch.nn.SmoothL1Loss(beta=1.0)`
+  - to `self.criterion = torch.nn.MSELoss()`
+- This returns standard SAC/REDQ-style critic pressure for large Bellman residuals.
+
+### [x] 3. Fresh Timeline for Validation
+
+- Updated `C:\\Users\\felix\\TmrlData\\config\\config.json` run name to `Test_Stagnation_run_4`.
+- Next run should be launched from a clean start to evaluate Phase 6 changes in isolation.
