@@ -770,10 +770,10 @@ class DroQSACAgent(TrainingAgent):
         # Check if model supports FiLM context (None = Vanilla baseline)
         uses_context = hasattr(self.model, 'context_encoder') and self.model.context_encoder is not None
 
-        # === Target Q computation (with no_grad, dropout disabled) ===
+        # === Target Q computation (with no_grad, dropout active) ===
         with torch.no_grad():
-            self.model_target.eval()  # Disable dropout for target
-            self.model.eval()         # BUG 1 FIX: Disable dropout for current policy
+            self.model_target.train()
+            self.model.train()        
             
             # BUG 1 FIX: Use CURRENT policy to get next action a2
             if uses_context and ctx_next is not None:
