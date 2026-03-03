@@ -77,14 +77,25 @@ class TM2020OpenPlanetClient:
 def save_ghost(host='127.0.0.1', port=10000):
     """
     Saves the current ghost
-
+    
     Args:
         host (str): IP address of the ghost-saving server
         port (int): Port of the ghost-saving server
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((host, port))
-
+    import logging
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((host, port))
+    except ConnectionRefusedError:
+        try:
+            import pydirectinput
+            import time
+            logging.info("OpenPlanet socket not available. Falling back to pydirectinput 'R' macro for Barrage Clip...")
+            pydirectinput.press('r')
+            time.sleep(0.5)
+            pydirectinput.press('enter')
+        except ImportError:
+            logging.warning("save_ghost() failed. OpenPlanet Ghost-saving plugin is not listening on port 10000, and pydirectinput is not installed.")
 
 def armin(tab):
     nz = np.nonzero(tab)[0]

@@ -768,6 +768,12 @@ class RolloutWorker:
 
         ret = 0.0
         steps = 0
+        
+        # Toggle evaluation mode in the underlying Trackmania interface (for save_ghost logic)
+        env_interface = getattr(self.env.unwrapped, "interface", getattr(self.env.unwrapped, "_RealTimeEnvTS__interface", None))
+        if env_interface is not None and hasattr(env_interface, "set_eval_mode"):
+            env_interface.set_eval_mode(deterministic)
+            
         obs, info = self.reset(collect_samples=False)
         for _ in iterator:
             obs, rew, terminated, truncated, info = self.step(
@@ -779,6 +785,11 @@ class RolloutWorker:
             steps += 1
             if terminated or truncated:
                 break
+                
+        # Disable evaluation mode so subsequent training episodes don't trigger save_ghost
+        if env_interface is not None and hasattr(env_interface, "set_eval_mode"):
+            env_interface.set_eval_mode(False)
+            
         return ret, steps
 
     def _set_test_stats(self, ret_det, steps_det, ret_stoch, steps_stoch, alias="stochastic"):

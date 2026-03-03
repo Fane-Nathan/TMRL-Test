@@ -66,6 +66,11 @@ class TM2020Interface(RealTimeGymInterface):
         self.constant_penalty = cfg.REWARD_CONFIG['CONSTANT_PENALTY']
 
         self.initialized = False
+        self._is_eval_episode = False
+
+    def set_eval_mode(self, is_eval: bool):
+        """Toggle whether the current episode is an evaluation episode (deterministic)."""
+        self._is_eval_episode = is_eval
 
     def initialize_common(self):
         if self.gamepad:
@@ -174,7 +179,8 @@ class TM2020Interface(RealTimeGymInterface):
         The agent stays 'paused', waiting in position
         """
         self.send_control(self.get_default_action())
-        if self.save_replays:
+        # Ghost Replays should only capture deterministic eval runs to prevent hard-drive bloat
+        if self.save_replays and self._is_eval_episode:
             save_ghost()
             time.sleep(1.0)
         self.reset_race()

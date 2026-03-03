@@ -890,7 +890,7 @@ class DroQSACAgent(TrainingAgent):
             self.loss_pi = loss_pi.detach()
 
         # === Polyak averaging ===
-        if update_policy:  # BUG 2 FIX: Only update target networks when policy updates!
+        if update_policy:
             with torch.no_grad():
                 for p, p_targ in zip(self.model.parameters(), self.model_target.parameters()):
                     p_targ.data.mul_(self.polyak)
