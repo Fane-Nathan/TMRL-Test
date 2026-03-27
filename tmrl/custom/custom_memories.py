@@ -2,7 +2,7 @@ import random
 import numpy as np
 
 from tmrl.memory import TorchMemory
-
+import tmrl.config.config_constants as cfg
 
 # LOCAL BUFFER COMPRESSION ==============================
 
@@ -66,18 +66,17 @@ def get_local_buffer_sample_tm20_imgs(prev_act, obs, rew, terminated, truncated,
 
 def get_local_buffer_sample_tm20_hybrid(prev_act, obs, rew, terminated, truncated, info):
     """
-    Sample compressor for MemoryTMHybrid (CNN + Lidar)
+    Sample compressor for MemoryTMHybrid (CNN + Lidar + XYZ + Progress)
     Input:
         prev_act: action computed from a previous observation
-        obs: (speed, gear, rpm, images, lidar, act1, act2) after preprocessing
+        obs: (speed, gear, rpm, images, lidar, xyz, progress) after preprocessing
         rew, terminated, truncated, info: outcome of the transition
-    Compressed format: (speed, gear, rpm, image_single, lidar)
+    Compressed format: (speed, gear, rpm, image_single, lidar, xyz, progress)
     CAUTION: prev_act is the action that comes BEFORE obs
     """
     prev_act_mod = prev_act
     # obs[3] = images (4 frames), we take only the last frame and convert to uint8
-    # obs[4] = lidar (19 floats)
-    obs_mod = (obs[0], obs[1], obs[2], (obs[3][-1] * 256.0).astype(np.uint8), obs[4])
+    obs_mod = (obs[0], obs[1], obs[2], (obs[3][-1] * 256.0).astype(np.uint8), obs[4], obs[5], obs[6])
     rew_mod = rew
     terminated_mod = terminated
     truncated_mod = truncated
@@ -605,6 +604,10 @@ class MemoryTMHybrid(MemoryTM):
     Observation format: (speed, gear, rpm, images, lidar, act1, act2)
     This stores all 7 components including lidar for the HybridNanoEffNet models.
     """
+    def __init__(self, *args, **kwargs):
+        self.K_context = 16  # number of sequence steps for context
+        super().__init__(*args, **kwargs)
+
     def get_transition(self, item):
         """
         CAUTION: item is the first index of the 4 images in the images history of the OLD observation
@@ -643,14 +646,20 @@ class MemoryTMHybrid(MemoryTM):
             replace_hist_before_eoe(hist=imgs_new_obs, eoe_idx_in_hist=last_eoe_idx - self.start_imgs_offset - 1)
             replace_hist_before_eoe(hist=imgs_last_obs, eoe_idx_in_hist=last_eoe_idx - self.start_imgs_offset)
 
-        # Observation format: (speed, gear, rpm, images, lidar, act1, act2)
-        # data indices: 2=speed, 7=gear, 8=rpm, imgs from load_imgs, 11=lidar
+        # Safe fallback for legacy replay buffers lacking Asymmetric SAC's privileged xyz / progress state
+        # np.atleast_1d ensures shape is always (N,) even if the stored value is a bare scalar
+        xyz_last = np.atleast_1d(self.data[12][idx_last]).astype(np.float32) if len(self.data) > 12 else np.zeros(3, dtype=np.float32)
+        prog_last = np.atleast_1d(self.data[13][idx_last]).astype(np.float32) if len(self.data) > 13 else np.zeros(1, dtype=np.float32)
+        xyz_now = np.atleast_1d(self.data[12][idx_now]).astype(np.float32) if len(self.data) > 12 else np.zeros(3, dtype=np.float32)
+        prog_now = np.atleast_1d(self.data[13][idx_now]).astype(np.float32) if len(self.data) > 13 else np.zeros(1, dtype=np.float32)
+
+        # Observation format: (speed, gear, rpm, images, lidar, xyz, progress, act1, act2)
         last_obs = (self.data[2][idx_last], self.data[7][idx_last], self.data[8][idx_last], 
-                    imgs_last_obs, self.data[11][idx_last], *last_act_buf)
+                    imgs_last_obs, self.data[11][idx_last], xyz_last, prog_last, *last_act_buf)
         new_act = self.data[1][idx_now]
         rew = np.float32(self.data[5][idx_now])
         new_obs = (self.data[2][idx_now], self.data[7][idx_now], self.data[8][idx_now], 
-                   imgs_new_obs, self.data[11][idx_now], *new_act_buf)
+                   imgs_new_obs, self.data[11][idx_now], xyz_now, prog_now, *new_act_buf)
         terminated = self.data[9][idx_now]
         truncated = self.data[10][idx_now]
         info = self.data[6][idx_now]
@@ -659,9 +668,12 @@ class MemoryTMHybrid(MemoryTM):
         # Build K+1 steps so trainer can use:
         # - ctx      = context[:-1]  (ends at t)
         # - ctx_next = context[1:]   (ends at t+1)
-        # Each step: speed(1) + lidar(19) + action(3) + reward(1) = 24
-        K = 16
-        context = np.zeros((K + 1, 24), dtype=np.float32)
+        # Telemetry Context: speed(1) + lidar(19) + action(3) = 23 (No Reward!)
+        K = self.K_context
+        context = np.zeros((K + 1, 23), dtype=np.float32)
+        # Image Context: 1 frame per step, size 64x64
+        img_context = np.zeros((K + 1, 1, cfg.IMG_HEIGHT, cfg.IMG_WIDTH), dtype=np.float32)
+
         total_data_len = len(self.data[0])
         for k in range(K + 1):
             ctx_idx = idx_now - K + k
@@ -672,18 +684,23 @@ class MemoryTMHybrid(MemoryTM):
             # Keep k == K intact so target (t+1) can still use its own terminal context.
             if self.data[4][ctx_idx] and k < K:
                 context[:k + 1] = 0.0
+                img_context[:k + 1] = 0.0
                 continue
 
             spd = np.float32(self.data[2][ctx_idx]).reshape(-1)[-1]
             lid = np.array(self.data[11][ctx_idx], dtype=np.float32).flatten()
             act_ctx = np.array(self.data[1][ctx_idx], dtype=np.float32).flatten()
-            rwrd = np.float32(self.data[5][ctx_idx]).reshape(-1)[-1]
             context[k, 0] = spd
             context[k, 1:20] = lid
             context[k, 20:23] = act_ctx
-            context[k, 23] = rwrd
 
-        return last_obs, new_act, rew, new_obs, terminated, truncated, info, context
+            # Get image for this step
+            img_frame = np.array(self.data[3][ctx_idx], dtype=np.float32) / 256.0
+            img_context[k, 0] = img_frame
+
+        # Note: Added img_context. To avoid breaking things that expect exactly 8 outputs,
+        # we append it to the tuple.
+        return last_obs, new_act, rew, new_obs, terminated, truncated, info, context, img_context
 
     def load_imgs(self, item):
         res = self.data[3][(item + self.start_imgs_offset):(item + self.start_imgs_offset + self.imgs_obs + 1)]
@@ -713,6 +730,19 @@ class MemoryTMHybrid(MemoryTM):
         d9 = [b[3] for b in buffer.memory]  # terminated
         d10 = [b[4] for b in buffer.memory]  # truncated
         d11 = [b[1][4] if len(b[1]) > 4 else np.zeros(19, dtype=np.float32) for b in buffer.memory]  # lidar
+        d12 = [b[1][5] if len(b[1]) > 5 else np.zeros(3, dtype=np.float32) for b in buffer.memory]  # xyz
+        d13 = [b[1][6] if len(b[1]) > 6 else np.array([0.0], dtype=np.float32) for b in buffer.memory]  # progress
+
+        # Check and pad if loaded from a checkpoint with missing Asymmetric arrays
+        if self.__len__() > 0:
+            while len(self.data) < 14:
+                pad_len = len(self.data[0])
+                if len(self.data) == 12:
+                    self.data.append([np.zeros(3, dtype=np.float32) for _ in range(pad_len)])  # 12: xyz
+                elif len(self.data) == 13:
+                    self.data.append([np.array([0.0], dtype=np.float32) for _ in range(pad_len)])  # 13: progress
+                else:
+                    break
 
         if self.__len__() > 0:
             self.data[0] += d0
@@ -727,6 +757,8 @@ class MemoryTMHybrid(MemoryTM):
             self.data[9] += d9
             self.data[10] += d10
             self.data[11] += d11
+            self.data[12] += d12
+            self.data[13] += d13
         else:
             self.data.append(d0)
             self.data.append(d1)
@@ -740,6 +772,8 @@ class MemoryTMHybrid(MemoryTM):
             self.data.append(d9)
             self.data.append(d10)
             self.data.append(d11)
+            self.data.append(d12)
+            self.data.append(d13)
 
         to_trim = self.__len__() - self.memory_size
         if to_trim > 0:
@@ -755,5 +789,7 @@ class MemoryTMHybrid(MemoryTM):
             self.data[9] = self.data[9][to_trim:]
             self.data[10] = self.data[10][to_trim:]
             self.data[11] = self.data[11][to_trim:]
+            self.data[12] = self.data[12][to_trim:]
+            self.data[13] = self.data[13][to_trim:]
 
         return self

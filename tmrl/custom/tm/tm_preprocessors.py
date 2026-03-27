@@ -46,9 +46,9 @@ def sample_preprocessor_tm_lidar_act_in_obs(last_obs, act, rew, new_obs, termina
 def obs_preprocessor_tm_hybrid(obs):
     """
     Preprocessor for TM2020 Hybrid (CNN + Lidar)
-    Input: (speed, gear, rpm, images, lidar, act1, act2)
+    Input: (speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2)
     """
-    speed, gear, rpm, images, lidar, act1, act2 = obs
+    speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2 = obs
 
     # Normalize images (0-255 -> 0.0-1.0) for the CNN
     images = images.astype(np.float32) / 256.0
@@ -61,4 +61,8 @@ def obs_preprocessor_tm_hybrid(obs):
     # Ensure lidar is flat and normalized (clipped to [0,1] to prevent overflow)
     lidar = np.clip(np.ndarray.flatten(lidar).astype(np.float32) / 300.0, 0.0, 1.0)
 
-    return (speed, gear, rpm, images, lidar, act1, act2)
+    # Normalize Asymmetric SAC additions
+    xyz = xyz / 1000.0
+    progress = progress / 100.0
+
+    return (speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2)

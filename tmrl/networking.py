@@ -764,6 +764,12 @@ class RolloutWorker:
         if max_samples is None:
             max_samples = self.max_samples_per_episode
 
+        # Context warmup: the PEARL context encoder's sliding window starts as
+        # zeros on episode reset.  Run the first WARMUP_STEPS with stochastic
+        # policy so the buffer fills with real transitions before switching to
+        # deterministic evaluation.
+        WARMUP_STEPS = 20  # > CONTEXT_WINDOW_SIZE (16)
+
         iterator = range(max_samples) if max_samples != np.inf else itertools.count()
 
         ret = 0.0
@@ -775,10 +781,12 @@ class RolloutWorker:
             env_interface.set_eval_mode(deterministic)
             
         obs, info = self.reset(collect_samples=False)
-        for _ in iterator:
+        for i in iterator:
+            # Use stochastic policy during warmup to fill context buffer
+            use_test = deterministic and (i >= WARMUP_STEPS)
             obs, rew, terminated, truncated, info = self.step(
                 obs=obs,
-                test=deterministic,
+                test=use_test,
                 collect_samples=False
             )
             ret += rew

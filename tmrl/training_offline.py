@@ -221,7 +221,6 @@ class TrainingOffline:
         """
         Applies safe, bounded auto-recovery actions when stalled.
         """
-        return "none"  # <--- SABOTEUR DISABLED
         action_parts = []
         stall_epochs = int(stall_state.get("stall_epochs", 0))
         warning_epochs = int(getattr(self, "_stall_warning_epochs", 5))

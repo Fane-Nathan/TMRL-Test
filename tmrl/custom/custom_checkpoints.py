@@ -159,6 +159,39 @@ def update_run_instance(run_instance, training_cls):
                 run_instance.agent.m = m
                 logging.info(f"M switched to {m} (old: {old}).")
 
+    # === EWC + Variational ContextEncoder Migration ===
+    # Runs for ALL algorithms (SAC, REDQSAC, DROQSAC)
+    # Patch missing attributes when loading old checkpoints with new code
+    agent = run_instance.agent
+
+    # EWC attributes
+    if not hasattr(agent, 'ewc_lambda'):
+        agent.ewc_lambda = ALG_CONFIG.get("EWC_LAMBDA", 0.0)
+        agent._ewc_fisher = {}
+        agent._ewc_params = {}
+        agent._ewc_active = False
+        logging.info("Checkpoint migrated: added EWC attributes (disabled).")
+
+    # Variational ContextEncoder migration
+    for model_attr in ('model', 'model_target'):
+        model_obj = getattr(agent, model_attr, None)
+        if model_obj is not None and hasattr(model_obj, 'context_encoder'):
+            ctx_enc = model_obj.context_encoder
+            if ctx_enc is not None and not hasattr(ctx_enc, 'mu_layer'):
+                import torch.nn as nn
+                z_dim = ctx_enc.z_dim
+                device = next(ctx_enc.parameters()).device
+                ctx_enc.mu_layer = nn.Linear(z_dim, z_dim).to(device)
+                ctx_enc.log_var_layer = nn.Linear(z_dim, z_dim).to(device)
+                nn.init.zeros_(ctx_enc.log_var_layer.weight)
+                nn.init.constant_(ctx_enc.log_var_layer.bias, -2.0)
+                ctx_enc.last_kl_div = torch.tensor(0.0)
+                logging.info(f"Checkpoint migrated: added variational layers to {model_attr}.context_encoder (z_dim={z_dim}).")
+                # Add new params to context optimizer group (only for main model)
+                if model_attr == 'model' and hasattr(agent, '_context_params'):
+                    agent._context_params += list(ctx_enc.mu_layer.parameters())
+                    agent._context_params += list(ctx_enc.log_var_layer.parameters())
+
     epochs = cfg.TMRL_CONFIG["MAX_EPOCHS"]
     rounds = cfg.TMRL_CONFIG["ROUNDS_PER_EPOCH"]
     update_model_interval = cfg.TMRL_CONFIG["UPDATE_MODEL_INTERVAL"]

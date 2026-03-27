@@ -1077,11 +1077,12 @@ class DroQQHead(nn.Module):
             nn.Linear(384, 1)
         )
 
-    def forward(self, features, act):
+    def forward(self, features, act, film=None):
         """
         Args:
             features: Pre-extracted encoder features (B, feature_dim)
             act: Actions (B, dim_act)
+            film: Ignored (for compatibility with FiLM loops)
         Returns:
             Q-values (B,)
         """
@@ -1222,39 +1223,50 @@ class ContextEncoder(nn.Module):
         self.z_dim = z_dim
         self.input_dim = input_dim
         self.max_len = max_len
-        enriched_dim = input_dim * 2  # raw + deltas
+        self.d_model = 128  # Fixed transformer dimension
 
-        # === 1. Positional Encoding ===
-        pe = torch.zeros(max_len, enriched_dim)
+        # === 1. Image Sequence CNN ===
+        # Processes (B*K, 1, 64, 64) -> (B*K, 64) spatial features
+        self.img_cnn = nn.Sequential(
+            nn.Conv2d(1, 16, 8, stride=4), nn.ReLU(),
+            nn.Conv2d(16, 32, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(32, 32, 3, stride=1), nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(32 * 4 * 4, 64),
+            nn.LayerNorm(64)
+        )
+        img_feat_dim = 64
+
+        # === 2. Positional Encoding ===
+        pe = torch.zeros(max_len, self.d_model)
         position = torch.arange(0, max_len).unsqueeze(1).float()
-        div_term = torch.exp(torch.arange(0, enriched_dim, 2).float() * -(np.log(10000.0) / enriched_dim))
+        div_term = torch.exp(torch.arange(0, self.d_model, 2).float() * -(np.log(10000.0) / self.d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pos_enc', pe.unsqueeze(0))
 
-        # === 2. Stabilized Projections (Spectral Norm) ===
+        # === 3. Stabilized Projections (Spectral Norm) ===
         from torch.nn.utils import spectral_norm
-        self.state_dim = 40
-        self.action_dim = 8
-        self.state_proj = spectral_norm(nn.Linear(self.state_dim, enriched_dim))
-        self.action_proj = spectral_norm(nn.Linear(self.action_dim, enriched_dim))
+        self.state_dim = 40 + img_feat_dim  # 40 (telemetry+deltas) + 64 (img) = 104
+        self.action_dim = 6  # 3 (act) + 3 (deltas)
+        self.state_proj = spectral_norm(nn.Linear(self.state_dim, self.d_model))
+        self.action_proj = spectral_norm(nn.Linear(self.action_dim, self.d_model))
 
-        # === 3. Causal Transformers (Dropout enabled) ===
-        # norm_first=True (Pre-LN) is crucial for RL gradient flow stability
+        # === 4. Causal Transformers ===
         state_layer = nn.TransformerEncoderLayer(
-            d_model=enriched_dim, nhead=4, dim_feedforward=128,
+            d_model=self.d_model, nhead=4, dim_feedforward=128,
             dropout=0.0, batch_first=True, norm_first=True
         )
         self.state_transformer = nn.TransformerEncoder(state_layer, num_layers=2)
 
         action_layer = nn.TransformerEncoderLayer(
-            d_model=enriched_dim, nhead=4, dim_feedforward=128,
+            d_model=self.d_model, nhead=4, dim_feedforward=128,
             dropout=0.0, batch_first=True, norm_first=True
         )
         self.action_transformer = nn.TransformerEncoder(action_layer, num_layers=2)
 
-        self.stream_gate = nn.Sequential(nn.Linear(enriched_dim * 2, enriched_dim), nn.Sigmoid())
-        self.gru = nn.GRU(enriched_dim, z_dim, num_layers=1, batch_first=True)
+        self.stream_gate = nn.Sequential(nn.Linear(self.d_model * 2, self.d_model), nn.Sigmoid())
+        self.gru = nn.GRU(self.d_model, z_dim, num_layers=1, batch_first=True)
 
         # Cross Attention & Output
         self.obs_proj = spectral_norm(nn.Linear(fused_dim, z_dim))
@@ -1264,11 +1276,14 @@ class ContextEncoder(nn.Module):
         self.compress = nn.Sequential(nn.Linear(4 * z_dim, z_dim), nn.LayerNorm(z_dim))
         self.norm = nn.LayerNorm(z_dim)
 
-        # Reward Predictors
-        self.reward_predictors = nn.ModuleList([
-            nn.Sequential(nn.Linear(z_dim, z_dim), nn.ReLU(), nn.Linear(z_dim, 1))
-            for _ in self.REWARD_HORIZONS
-        ])
+        # Variational inference: z ~ N(μ, σ²) with KL(q(z|c) || N(0,I))
+        self.mu_layer = nn.Linear(z_dim, z_dim)
+        self.log_var_layer = nn.Linear(z_dim, z_dim)
+        # Initialize log_var to produce small variance initially (stable start)
+        nn.init.zeros_(self.log_var_layer.weight)
+        nn.init.constant_(self.log_var_layer.bias, -2.0)  # σ² ≈ 0.14
+        self.last_kl_div = torch.tensor(0.0)  # stored for training loop access
+
 
         # Inference Buffer
         self._window_buffer = None
@@ -1284,16 +1299,27 @@ class ContextEncoder(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-    def predict_reward(self, z):
-        return [head(z).squeeze(-1) for head in self.reward_predictors]
 
-    def forward(self, context_seq, fused_obs=None):
+    def forward(self, context_seq, img_context=None, fused_obs=None):
         B, K, _ = context_seq.shape
         enriched = self._compute_deltas(context_seq)
         
         # Split Features
-        state_feats = torch.cat([enriched[:, :, :20], enriched[:, :, 24:44]], dim=-1)
-        action_feats = torch.cat([enriched[:, :, 20:24], enriched[:, :, 44:48]], dim=-1)
+        # Telemetry: speed+lidar (0:20), actions (20:23)
+        # enriched has length 46 (input_dim=23 -> raw+deltas)
+        state_telemetry = torch.cat([enriched[:, :, :20], enriched[:, :, 23:43]], dim=-1)
+        action_feats = torch.cat([enriched[:, :, 20:23], enriched[:, :, 43:46]], dim=-1)
+        
+        # Image Context Features
+        if img_context is not None:
+            B_img, K_img, C, H, W = img_context.shape
+            # (B*K, C, H, W)
+            img_flat = img_context.reshape(B_img * K_img, C, H, W)
+            img_feats = self.img_cnn(img_flat).reshape(B, K, 64)
+        else:
+            img_feats = torch.zeros(B, K, 64, device=context_seq.device)
+            
+        state_feats = torch.cat([state_telemetry, img_feats], dim=-1)
         
         state_seq = self.state_proj(state_feats) + self.pos_enc[:, :K, :]
         action_seq = self.action_proj(action_feats) + self.pos_enc[:, :K, :]
@@ -1327,7 +1353,24 @@ class ContextEncoder(nn.Module):
         queries = self.pool_queries.expand(B, -1, -1)
         pooled, _ = self.pool_attn(queries, gru_out, gru_out)
         pool_z = self.compress(pooled.reshape(B, -1))
-        z = self.norm(cross_z + pool_z)
+        z_pre = self.norm(cross_z + pool_z)
+
+        # Variational: produce μ and log(σ²), sample z
+        mu = self.mu_layer(z_pre)
+        log_var = self.log_var_layer(z_pre).clamp(-6, 2)  # prevent extreme variance
+
+        if self.training:
+            # Reparameterization trick: z = μ + σ·ε, ε ~ N(0,I)
+            std = torch.exp(0.5 * log_var)
+            eps = torch.randn_like(std)
+            z = mu + std * eps
+            # KL divergence: KL(N(μ,σ²) || N(0,I))
+            self.last_kl_div = -0.5 * torch.mean(torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=-1))
+        else:
+            # Deterministic during inference (use mean)
+            z = mu
+            self.last_kl_div = torch.tensor(0.0, device=z.device)
+
         return z
 
     def get_initial_hidden(self, batch_size=1, device='cpu'):
@@ -1335,8 +1378,9 @@ class ContextEncoder(nn.Module):
 
     def reset_online_state(self):
         self._window_buffer = None
+        self._img_window_buffer = None
 
-    def step(self, context_step, hidden, fused_obs=None):
+    def step(self, context_step, hidden, img_context_step=None, fused_obs=None):
         """
         Sliding Window Inference:
         We now buffer the last K steps and run the FULL Transformer.
@@ -1349,16 +1393,29 @@ class ContextEncoder(nn.Module):
                 device=context_step.device,
                 dtype=context_step.dtype,
             )
+            if img_context_step is not None:
+                self._img_window_buffer = torch.zeros(
+                    (img_context_step.shape[0], self.max_len, *img_context_step.shape[1:]),
+                    device=img_context_step.device,
+                    dtype=img_context_step.dtype,
+                )
+            else:
+                self._img_window_buffer = None
 
         # 2. Shift left and append latest context token.
         self._window_buffer = torch.roll(self._window_buffer, shifts=-1, dims=1)
         self._window_buffer[:, -1, :] = context_step
+        
+        if self._img_window_buffer is not None and img_context_step is not None:
+            self._img_window_buffer = torch.roll(self._img_window_buffer, shifts=-1, dims=1)
+            self._img_window_buffer[:, -1] = img_context_step
 
         # 3. Run Full Forward Pass (Robust)
         # We call forward() directly. It handles masking and deltas.
-        z = self.forward(self._window_buffer, fused_obs=fused_obs)
+        z = self.forward(self._window_buffer, img_context=self._img_window_buffer, fused_obs=fused_obs)
         
         # We don't need to pass hidden state between steps manually anymore 
+
         # because the buffer + full forward pass handles the temporal state.
         return z, None
 class FiLMGenerator(nn.Module):
@@ -1499,19 +1556,20 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
         self.context_encoder = ContextEncoder(input_dim=CONTEXT_INPUT_DIM, z_dim=CONTEXT_Z_DIM)
         self._gru_hidden = None  # persistent hidden state for online inference
 
-        # FiLM Generator: z → (γ, β) pairs for each hidden layer
-        self.film_generator = FiLMGenerator(z_dim=CONTEXT_Z_DIM, hidden_dim=FILM_HIDDEN, n_layers=FILM_N_LAYERS)
-
-        # FiLM-modulated Policy MLP: input = fused(128) only, modulated by z via FiLM
-        self.net = FiLMActorMLP(input_dim=FUSED_DIM, hidden_dim=FILM_HIDDEN, n_layers=FILM_N_LAYERS)
-        self.mu_layer = nn.Linear(FILM_HIDDEN, dim_act)
-        self.log_std_layer = nn.Linear(FILM_HIDDEN, dim_act)
+        # PEARL Policy MLP: Actor receives z for fast context-based adaptation
+        self.net = mlp([FUSED_DIM + CONTEXT_Z_DIM, 256, 256], nn.ReLU, nn.ReLU)
+        self.mu_layer = nn.Linear(256, dim_act)
+        # Smart init: car drives forward from step 1 (steer=0, gas=0.3, brake=0)
+        with torch.no_grad():
+            nn.init.zeros_(self.mu_layer.weight)
+            self.mu_layer.bias.copy_(torch.tensor([0.0, 1.5, 0.0]))
+        
         self.std_net = nn.Sequential(
-            nn.Linear(FUSED_DIM, 64),
+            nn.Linear(FUSED_DIM + CONTEXT_Z_DIM, 64),
             nn.SiLU(),
             nn.Linear(64, dim_act)
         )
-        # Fix 6: Initialize bias to 1.0 -> tanh(0.97) -> log_std ~ -0.7 -> std ~ 0.5
+        # Initialize bias to 1.0 -> tanh(0.97) -> log_std ~ -0.7 -> std ~ 0.5
         nn.init.constant_(self.std_net[-1].bias, 1.0)
         self.act_limit = act_limit
         # Previous reward from worker-side rollout for online context alignment.
@@ -1519,13 +1577,16 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
 
     def _build_context_step(self, obs):
         """Build a single context vector from current observation for online GRU stepping."""
-        speed, gear, rpm, images, lidar, act1, act2 = obs
+        if len(obs) == 9:
+            speed, gear, rpm, images, lidar, xyz, progress, act1, act2 = obs
+        else:
+            speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2 = obs
+            
         # action = last action (act1 is the most recent in act_buf)
-        # Use previous rollout reward (set by RolloutWorker) to match training context.
-        prev_reward = torch.full_like(speed, float(self._online_prev_reward))
-        # prev_reward = torch.zeros_like(speed)  # Zero out reward for consistency
-        ctx = torch.cat((speed, lidar, act1, prev_reward), dim=-1)
-        return ctx  # (B, 24)
+        ctx = torch.cat((speed, lidar, act1), dim=-1)  # (B, 23)
+        # In online mode, images has shape (B, 4, 64, 64). We take the latest frame.
+        img_ctx = images[:, -1:, :, :]  # (B, 1, 64, 64)
+        return ctx, img_ctx
 
     def set_online_transition(self, reward=0.0, terminated=False, truncated=False, train_mode=True):
         """
@@ -1538,7 +1599,13 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
             self._online_prev_reward = float(reward)
 
     def forward(self, obs, test=False, with_logprob=True):
-        speed, gear, rpm, images, lidar, act1, act2 = obs
+        if len(obs) == 9:
+            speed, gear, rpm, images, lidar, xyz, progress, act1, act2 = obs
+            B = images.shape[0] if isinstance(images, torch.Tensor) else 1
+            crash = torch.zeros((B, 1), device=speed.device)
+            progress_gain = torch.zeros((B, 1), device=speed.device)
+        else:
+            speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2 = obs
 
         # Encode
         img_embed = self.cnn(images.float())
@@ -1549,20 +1616,21 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
         fused = self.fusion_gate(img_embed, float_embed)  # (B, 128)
 
         # Context: step GRU with current observation
-        ctx_input = self._build_context_step(obs)
+        ctx_input, img_ctx_input = self._build_context_step(obs)
         device = fused.device
         if self._gru_hidden is None or self._gru_hidden.device != device:
             self._gru_hidden = self.context_encoder.get_initial_hidden(
                 batch_size=ctx_input.shape[0], device=device)
-        z, self._gru_hidden = self.context_encoder.step(ctx_input, self._gru_hidden, fused_obs=fused)
+        z, self._gru_hidden = self.context_encoder.step(
+            ctx_input, self._gru_hidden, img_context_step=img_ctx_input, fused_obs=fused)
 
-        # FiLM: z → (γ, β) pairs → modulate actor MLP
-        film_params = self.film_generator(z)
-        net_out = self.net(fused, film_params)  # (B, 384)
+        # PEARL: Actor is conditioned on context z for fast adaptation
+        actor_input = torch.cat([fused, z], dim=-1)
+        net_out = self.net(actor_input)
 
-        # Policy head - DECOUPLED mu/std
+        # Policy head - context-conditioned mu/std
         mu = self.mu_layer(net_out)
-        log_std_raw = self.std_net(fused)
+        log_std_raw = self.std_net(actor_input)
         log_std = _compute_log_std_smooth(log_std_raw)
         std = torch.exp(log_std)
 
@@ -1582,9 +1650,13 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
         return pi_action, logp_pi
 
     def act(self, obs, test=False):
+        was_training = self.training
+        self.eval()
         with torch.no_grad():
             a, _ = self.forward(obs, test, False)
-            return a.squeeze().cpu().numpy()
+        if was_training:
+            self.train()
+        return a.squeeze().cpu().numpy()
 
     def reset_context(self):
         """Call at the beginning of each episode to reset GRU state."""
@@ -1616,54 +1688,84 @@ class ContextualDroQHybridActorCritic(nn.Module):
         self._actor_float_mlp = self.actor.float_mlp
         self._actor_fusion_gate = self.actor.fusion_gate
 
-        # Shared context encoder + FiLM generator (used during training)
+        # Shared context encoder (used during training to provide z to the Critic)
         self.context_encoder = self.actor.context_encoder
-        self.film_generator = self.actor.film_generator
 
-        # 2 FiLM-modulated Q-heads with DroQ dropout
+        # 2 Q-heads with DroQ dropout
+        # Critic is asymmetric: skips FusionGate, takes 34-dim numeric float vector + z
         self.qs = ModuleList([
-            FiLMQHead(action_space, input_dim=FUSED_DIM, hidden_dim=FILM_HIDDEN,
-                      n_layers=FILM_N_LAYERS, dropout_rate=dropout_rate)
+            DroQQHead(action_space, feature_dim=34 + CONTEXT_Z_DIM, dropout_rate=dropout_rate)
             for _ in range(2)
         ])
 
-    def forward_features(self, obs, context=None):
+    def forward_features(self, obs, context=None, img_context=None):
         """
         Extract features and FiLM params using actor's encoder.
         
         Args:
-            obs: tuple of (speed, gear, rpm, images, lidar, act1, act2)
-            context: (B, K, 24) tensor of recent transitions, or None
+            obs: tuple of (speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2)
+            context: (B, K, 23) tensor of recent transitions, or None
+            img_context: (B, K, 1, 64, 64) tensor of recent images, or None
         Returns:
-            fused: (B, FUSED_DIM) fused sensor features
+            fused: (B, FUSED_DIM) fused sensor features for the Actor
+            critic_floats: (B, 34) float features for the Critic
             film_params: list of (γ, β) tuples for FiLM modulation
         """
-        speed, gear, rpm, images, lidar, act1, act2 = obs
+        if len(obs) == 9:
+            speed, gear, rpm, images, lidar, xyz, progress, act1, act2 = obs
+            B = images.shape[0]
+            crash = torch.zeros((B, 1), device=speed.device)
+            progress_gain = torch.zeros((B, 1), device=speed.device)
+        else:
+            speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2 = obs
+            B = images.shape[0]
+        
+        # Ensure all flat features are strictly 2D (Batch, Dim) regardless of how the replay buffer padded them
+        speed = speed.view(B, -1)
+        gear = gear.view(B, -1)
+        rpm = rpm.view(B, -1)
+        lidar = lidar.view(B, -1)
+        xyz = xyz.view(B, -1)
+        progress = progress.view(B, -1)
+        crash = crash.view(B, -1)
+        progress_gain = progress_gain.view(B, -1)
+        act1 = act1.view(B, -1)
+        act2 = act2.view(B, -1)
 
         img_embed = self._actor_cnn(images.float())
-        floats = torch.cat((speed, gear, rpm, lidar, act1, act2), dim=-1)
-        float_embed = self._actor_float_mlp(floats)
+        actor_floats = torch.cat((speed, gear, rpm, lidar, act1, act2), dim=-1)
+        float_embed = self._actor_float_mlp(actor_floats)
 
-        # Fusion Gate
+        # Fusion Gate for Actor
         fused = self._actor_fusion_gate(img_embed, float_embed)  # (B, 128)
 
-        # Context → FiLM params (cross-attention queries history with current obs)
+        # Critic sees EVERYTHING except pixels (Asymmetric SAC)
+        # Added crash (1) and progress_gain (1) to critic features
+        critic_floats = torch.cat((speed, gear, rpm, lidar, xyz, progress, crash, progress_gain, act1, act2), dim=-1)
+
+        # Context → latent belief `z`
         if context is not None:
-            z = self.context_encoder(context, fused_obs=fused)  # (B, 64)
+            z = self.context_encoder(context, img_context=img_context, fused_obs=fused)  # (B, 64)
         else:
             z = torch.zeros(fused.shape[0], CONTEXT_Z_DIM, device=fused.device)
 
-        film_params = self.film_generator(z)
-        return fused, film_params, z
+        # Asymmetric Critic concatenated belief
+        critic_features = torch.cat([critic_floats, z], dim=-1) # (B, 32 + 64)
 
-    def actor_from_features(self, fused, film_params, test=False, with_logprob=True):
-        """Compute action from fused features + FiLM params."""
+        # Removed FiLM params generation
+        # film_params = self.film_generator(z)
+        return fused, critic_features, None, z # Modified: film_params is now None
+
+    def actor_from_features(self, fused, film_params=None, test=False, with_logprob=True, z=None):
+        """Compute action from fused features + context z (PEARL)."""
+        del film_params
         fused = fused.detach()
-        if film_params is not None:
-            film_params = [(gamma.detach(), beta.detach()) for gamma, beta in film_params]
-        net_out = self.actor.net(fused, film_params)  # FiLM-modulated actor MLP
+        if z is None:
+            z = torch.zeros(fused.shape[0], CONTEXT_Z_DIM, device=fused.device)
+        actor_input = torch.cat([fused, z.detach()], dim=-1)
+        net_out = self.actor.net(actor_input)
         mu = self.actor.mu_layer(net_out)
-        log_std_raw = self.actor.std_net(fused)
+        log_std_raw = self.actor.std_net(actor_input)
         log_std = _compute_log_std_smooth(log_std_raw)
         std = torch.exp(log_std)
 
@@ -1682,11 +1784,11 @@ class ContextualDroQHybridActorCritic(nn.Module):
         pi_action = self.actor.act_limit * pi_action
         return pi_action, logp_total, logp_per_dim
 
-    def q_from_features(self, fused, act, film_params, q_idx=None):
-        """Compute Q-values from fused features + FiLM params."""
+    def q_from_features(self, critic_floats, act, film_params, q_idx=None):
+        """Compute Q-values from critic float features + FiLM params."""
         if q_idx is not None:
-            return self.qs[q_idx](fused, act, film_params)
-        return [q(fused, act, film_params) for q in self.qs]
+            return self.qs[q_idx](critic_floats, act, film_params)
+        return [q(critic_floats, act, film_params) for q in self.qs]
 
     def act(self, obs, test=False):
         with torch.no_grad():
@@ -1853,3 +1955,506 @@ class RNNActorCritic(nn.Module):
         self.actor = SquashedGaussianRNNActor(observation_space, action_space, rnn_size, rnn_len, mlp_sizes, activation)
         self.q1 = RNNQFunction(observation_space, action_space, rnn_size, rnn_len, mlp_sizes, activation)
         self.q2 = RNNQFunction(observation_space, action_space, rnn_size, rnn_len, mlp_sizes, activation)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  LATENT-SPACE WORLD MODEL — RSSM (DreamerV3-style)
+# ═══════════════════════════════════════════════════════════════
+#
+# Architecture:
+#   Encoder:    obs(26) → z(latent_dim)
+#   Prior:      GRU(h, a) → ẑ(t+1)       [predicted next latent]
+#   Posterior:  h(t+1) + obs(t+1) → z(t+1) [grounded next latent]
+#   Decoder:    z → obs_hat, reward_hat
+#
+# The KL(posterior || prior) loss trains the prior to match reality.
+# At imagination time, only the prior is used (no observations needed).
+# ═══════════════════════════════════════════════════════════════
+
+
+class RSSMEncoder(nn.Module):
+    """Encode raw 26-dim critic state into a compact latent vector z."""
+    def __init__(self, state_dim=26, latent_dim=32, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+        )
+        self.mu = nn.Linear(hidden_dim, latent_dim)
+        self.log_var = nn.Linear(hidden_dim, latent_dim)
+        # Start with small variance for stability
+        nn.init.zeros_(self.log_var.weight)
+        nn.init.constant_(self.log_var.bias, -2.0)
+
+    def forward(self, state):
+        """
+        Args:
+            state: (B, state_dim)
+        Returns:
+            mu: (B, latent_dim)
+            log_var: (B, latent_dim)
+            z: (B, latent_dim) — reparameterized sample
+        """
+        h = self.net(state)
+        mu = self.mu(h)
+        log_var = self.log_var(h).clamp(-6, 2)
+        if self.training:
+            std = torch.exp(0.5 * log_var)
+            z = mu + std * torch.randn_like(std)
+        else:
+            z = mu
+        return mu, log_var, z
+
+
+class RSSMPrior(nn.Module):
+    """
+    Transition model: predicts next latent from GRU hidden state.
+    GRU input = concat(z_t, action_t), output h_{t+1}.
+    Then h_{t+1} → (mu_prior, log_var_prior) for ẑ_{t+1}.
+    """
+    def __init__(self, latent_dim=32, action_dim=3, gru_dim=128, hidden_dim=256):
+        super().__init__()
+        self.gru_dim = gru_dim
+        # Pre-process (z, action) before feeding to GRU
+        self.pre_gru = nn.Sequential(
+            nn.Linear(latent_dim + action_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.gru = nn.GRUCell(hidden_dim, gru_dim)
+        # Map GRU hidden state to prior distribution parameters
+        self.mu = nn.Linear(gru_dim, latent_dim)
+        self.log_var = nn.Linear(gru_dim, latent_dim)
+        nn.init.zeros_(self.log_var.weight)
+        nn.init.constant_(self.log_var.bias, -2.0)
+
+    def forward(self, h, z, action):
+        """
+        One-step transition.
+        Args:
+            h: (B, gru_dim) — previous GRU hidden state
+            z: (B, latent_dim) — previous latent
+            action: (B, action_dim)
+        Returns:
+            h_next: (B, gru_dim)
+            mu_prior: (B, latent_dim)
+            log_var_prior: (B, latent_dim)
+        """
+        x = self.pre_gru(torch.cat([z, action], dim=-1))
+        h_next = self.gru(x, h)
+        mu_prior = self.mu(h_next)
+        log_var_prior = self.log_var(h_next).clamp(-6, 2)
+        return h_next, mu_prior, log_var_prior
+
+    def get_initial_hidden(self, batch_size, device):
+        return torch.zeros(batch_size, self.gru_dim, device=device)
+
+
+class RSSMPosterior(nn.Module):
+    """
+    Observation-conditioned refinement of prior prediction.
+    Combines GRU hidden state h_{t+1} with the encoded observation
+    to produce a more accurate posterior distribution for z_{t+1}.
+    """
+    def __init__(self, gru_dim=128, state_dim=26, latent_dim=32, hidden_dim=256):
+        super().__init__()
+        # Combine GRU hidden + raw observation for posterior
+        self.net = nn.Sequential(
+            nn.Linear(gru_dim + state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.mu = nn.Linear(hidden_dim, latent_dim)
+        self.log_var = nn.Linear(hidden_dim, latent_dim)
+        nn.init.zeros_(self.log_var.weight)
+        nn.init.constant_(self.log_var.bias, -2.0)
+
+    def forward(self, h, obs_next):
+        """
+        Args:
+            h: (B, gru_dim) — GRU hidden state AFTER transition
+            obs_next: (B, state_dim) — actual next observation
+        Returns:
+            mu_post: (B, latent_dim)
+            log_var_post: (B, latent_dim)
+            z_post: (B, latent_dim) — reparameterized sample
+        """
+        x = self.net(torch.cat([h, obs_next], dim=-1))
+        mu = self.mu(x)
+        log_var = self.log_var(x).clamp(-6, 2)
+        if self.training:
+            std = torch.exp(0.5 * log_var)
+            z = mu + std * torch.randn_like(std)
+        else:
+            z = mu
+        return mu, log_var, z
+
+
+class RSSMDecoder(nn.Module):
+    """Decode latent z back to critic state + reward.
+
+    Reward uncertainty via MC-Dropout: a single reward network with dropout
+    is run N times with different dropout masks to estimate epistemic
+    uncertainty. This CANNOT collapse because the variance comes from
+    inference-time dropout randomness, not from weight diversity.
+    """
+    def __init__(self, latent_dim=32, gru_dim=128, state_dim=26, hidden_dim=256, num_reward_heads=5):
+        super().__init__()
+        self.num_reward_heads = num_reward_heads  # used as num_mc_samples for MC-Dropout
+        self.num_mc_samples = num_reward_heads  # alias for clarity
+        self.bootstrap_ratio = 0.5
+        self.state_net = nn.Sequential(
+            nn.Linear(latent_dim + gru_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, state_dim),
+        )
+        # Single reward network with heavier dropout for MC-Dropout uncertainty
+        self.reward_net = nn.Sequential(
+            nn.Linear(latent_dim + gru_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(p=0.4),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Dropout(p=0.4),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+        # Keep reward_nets as alias pointing to a ModuleList wrapping the single net
+        # for backward compatibility with checkpoint loading
+        self.reward_nets = nn.ModuleList([self.reward_net])
+
+    def forward(self, z, h):
+        """
+        Args:
+            z: (B, latent_dim)
+            h: (B, gru_dim)
+        Returns:
+            state_hat: (B, state_dim) — reconstructed critic state
+            reward_hats: (num_mc_samples, B, 1) — MC-Dropout reward predictions
+        """
+        combined = torch.cat([z, h], dim=-1)
+        state_hat = self.state_net(combined)
+
+        # Always run reward_net with dropout ENABLED for MC-Dropout uncertainty
+        # Force train mode on reward_net regardless of model mode
+        was_training = self.reward_net.training
+        self.reward_net.train()
+
+        reward_hats = torch.stack(
+            [self.reward_net(combined) for _ in range(self.num_mc_samples)],
+            dim=0
+        )  # (num_mc_samples, B, 1) — each pass has different dropout mask
+
+        # Restore original mode
+        if not was_training:
+            self.reward_net.eval()
+
+        return state_hat, reward_hats
+
+    def generate_bootstrap_masks(self, batch_size, device):
+        """Generate bootstrap masks for training.
+
+        Returns: (num_mc_samples, B) boolean tensor
+        """
+        k = max(1, int(batch_size * self.bootstrap_ratio))
+        masks = torch.zeros(self.num_mc_samples, batch_size, dtype=torch.bool, device=device)
+        for i in range(self.num_mc_samples):
+            idx = torch.randperm(batch_size, device=device)[:k]
+            masks[i, idx] = True
+        return masks
+
+
+class ImaginationActor(nn.Module):
+    """
+    Lightweight MLP policy for imagination rollouts.
+
+    Maps critic-state (28-dim: speed/gear/rpm/lidar/xyz/progress/crash/progress_gain)
+    to actions (3-dim: steer/gas/brake) with tanh output.
+
+    Trained to mimic the real actor's behavior from (critic_state, action) pairs
+    collected during regular training. Used in _imagined_critic_update so that
+    imagined rollouts follow realistic trajectories instead of random actions.
+    """
+    def __init__(self, state_dim=28, action_dim=3, hidden_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, action_dim),
+            nn.Tanh(),
+        )
+
+    def forward(self, critic_state):
+        """
+        Args:
+            critic_state: (B, state_dim) — raw telemetry vector
+        Returns:
+            action: (B, action_dim) — bounded in [-1, 1]
+        """
+        return self.net(critic_state)
+
+
+class RunningMeanStd:
+    """
+    Welford's online algorithm for running mean/variance.
+
+    Used to normalize curiosity surprise so it doesn't overwhelm the RL reward
+    signal early in training (when the world model is bad and surprise is huge)
+    or vanish late (when the model has converged and surprise is near zero).
+
+    Not an nn.Module — just a state container. Compatible with pickle for
+    checkpoint serialization.
+    """
+    def __init__(self):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = 1e-4  # small epsilon to avoid division by zero
+
+    def update(self, x):
+        """Update running stats with a batch of values.
+        Args:
+            x: torch.Tensor of shape (B,) or scalar
+        """
+        if hasattr(x, 'mean'):
+            batch_mean = float(x.mean().item())
+            batch_var = float(x.var().item()) if x.numel() > 1 else 0.0
+            batch_count = int(x.numel())
+        else:
+            batch_mean = float(x)
+            batch_var = 0.0
+            batch_count = 1
+
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        self.mean += delta * batch_count / total
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / total
+        self.var = m2 / total
+        self.count = total
+
+    def normalize(self, x):
+        """Normalize values using running statistics.
+        Args:
+            x: torch.Tensor
+        Returns:
+            normalized x (zero-mean, unit-variance based on running stats)
+        """
+        return x / (self.var ** 0.5 + 1e-8)
+
+
+class LatentWorldModel(nn.Module):
+    """
+    RSSM World Model (DreamerV3-style) for model-based RL.
+
+    Training:
+        Given sequences (s_t, a_t, s_{t+1}, r_t):
+        1. Encode s_t → z_t
+        2. Prior: GRU(h, z_t, a_t) → h_{t+1}, ẑ_{t+1}
+        3. Posterior: h_{t+1} + s_{t+1} → z_{t+1} (ground truth)
+        4. Loss = recon(decode(z_post) vs s_{t+1}) + KL(post || prior)
+
+    Imagination:
+        Roll out using prior only (no observations):
+        1. Start from real state s → z via encoder
+        2. Unroll: prior(h, z, a) → h', ẑ' → decode(ẑ') → (ŝ', r̂')
+        3. Repeat for H steps
+    """
+    def __init__(self, state_dim=26, action_dim=3, latent_dim=32,
+                 gru_dim=128, hidden_dim=256, kl_free_nats=1.0, num_reward_heads=5):
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.latent_dim = latent_dim
+        self.gru_dim = gru_dim
+        self.kl_free_nats = kl_free_nats
+
+        self.encoder = RSSMEncoder(state_dim, latent_dim, hidden_dim)
+        self.prior = RSSMPrior(latent_dim, action_dim, gru_dim, hidden_dim)
+        self.posterior = RSSMPosterior(gru_dim, state_dim, latent_dim, hidden_dim)
+        self.decoder = RSSMDecoder(latent_dim, gru_dim, state_dim, hidden_dim, num_reward_heads)
+
+    def train_step(self, state, action, next_state, reward):
+        """
+        Single training step on a batch of transitions.
+        Args:
+            state: (B, state_dim)
+            action: (B, action_dim)
+            next_state: (B, state_dim)
+            reward: (B, 1)
+        Returns:
+            loss: scalar — total RSSM loss
+            metrics: dict with component losses for logging
+        """
+        self.train()
+        B = state.shape[0]
+
+        # 1. Encode current state
+        _, _, z_t = self.encoder(state)
+
+        # 2. Prior: predict next latent from (h, z_t, action)
+        h_t = self.prior.get_initial_hidden(B, state.device)
+        h_next, mu_prior, log_var_prior = self.prior(h_t, z_t, action)
+
+        # 3. Posterior: refine using actual next observation
+        mu_post, log_var_post, z_post = self.posterior(h_next, next_state)
+
+        # 4. Decode from posterior latent (training uses ground-truth-grounded z)
+        state_hat, reward_hats = self.decoder(z_post, h_next)
+
+        # === Losses ===
+        # Reconstruction loss
+        recon_state = F.mse_loss(state_hat, next_state)
+
+        # Bootstrap reward loss: each head trained on its own random subset
+        bootstrap_masks = self.decoder.generate_bootstrap_masks(B, state.device)  # (num_heads, B)
+        reward_target = reward.unsqueeze(0).expand_as(reward_hats)  # (num_heads, B, 1)
+        reward_errors = (reward_hats - reward_target).pow(2)  # (num_heads, B, 1)
+        # Mask: only count errors for samples assigned to each head
+        mask_expanded = bootstrap_masks.unsqueeze(-1).float()  # (num_heads, B, 1)
+        recon_reward = (reward_errors * mask_expanded).sum() / mask_expanded.sum().clamp(min=1.0)
+
+        loss_recon = recon_state + recon_reward
+
+        # KL divergence: KL(posterior || prior), with free nats
+        kl = self._kl_divergence(mu_post, log_var_post, mu_prior, log_var_prior)
+        kl_clamped = torch.clamp(kl, min=self.kl_free_nats)
+
+        loss = loss_recon + kl_clamped
+
+        metrics = {
+            "wm_recon_state": recon_state.item(),
+            "wm_recon_reward": recon_reward.item(),
+            "wm_kl": kl.item(),
+            "wm_kl_clamped": kl_clamped.item(),
+            "wm_total_loss": loss.item(),
+        }
+        return loss, metrics
+
+    @staticmethod
+    def _kl_divergence(mu_post, log_var_post, mu_prior, log_var_prior):
+        """
+        KL(N(mu_post, var_post) || N(mu_prior, var_prior))
+        Averaged over batch and latent dims.
+        """
+        var_post = log_var_post.exp()
+        var_prior = log_var_prior.exp()
+        kl = 0.5 * (
+            log_var_prior - log_var_post
+            + var_post / var_prior
+            + (mu_post - mu_prior).pow(2) / var_prior
+            - 1.0
+        )
+        return kl.sum(dim=-1).mean()  # sum over latent, mean over batch
+
+    @torch.no_grad()
+    def imagine(self, state, policy_fn, horizon, gamma=0.99):
+        """
+        Imagine future trajectories in latent space using the prior only.
+        Args:
+            state: (B, state_dim) — real starting states
+            policy_fn: callable(critic_state) → action — the current policy
+            horizon: int — number of imagination steps
+            gamma: float — discount for computing returns
+        Returns:
+            imagined_states: (H, B, state_dim) — decoded states
+            imagined_rewards: (H, B, 1) — decoded mean rewards
+            imagined_actions: (H, B, action_dim)
+            imagined_uncertainty: (H, B, 1) — ensemble reward variance
+        """
+        self.eval()  # Disable BN/Dropout for core RSSM (reward_net dropout handled inside forward())
+        B = state.shape[0]
+
+        # Encode starting state
+        _, _, z = self.encoder(state)
+        h = self.prior.get_initial_hidden(B, state.device)
+
+        all_states = []
+        all_rewards = []
+        all_actions = []
+        all_uncertainties = []
+
+        for t in range(horizon):
+            # Decode current latent to get critic state for policy
+            decoded_state, _ = self.decoder(z, h)
+            all_states.append(decoded_state)
+
+            # Get action from policy
+            action = policy_fn(decoded_state)
+            all_actions.append(action)
+
+            # Step forward using prior (no observation needed)
+            h, mu_prior, log_var_prior = self.prior(h, z, action)
+            # Use the mean (deterministic) during imagination for stability
+            z = mu_prior
+
+            # Decode reward at the new state
+            _, reward_hats = self.decoder(z, h)
+            mean_reward = reward_hats.mean(dim=0)
+            # Use coefficient of variation (std / |mean|) for scale-invariant uncertainty
+            # Raw variance collapses to ~0 when reward predictions are near-zero
+            reward_std = reward_hats.std(dim=0)
+            uncertainty = reward_std / (mean_reward.abs() + 1e-6)  # (B, 1)
+            all_rewards.append(mean_reward)
+            all_uncertainties.append(uncertainty)
+
+        self.train()
+        return (
+            torch.stack(all_states, dim=0),     # (H, B, state_dim)
+            torch.stack(all_rewards, dim=0),     # (H, B, 1)
+            torch.stack(all_actions, dim=0),     # (H, B, action_dim)
+            torch.stack(all_uncertainties, dim=0) # (H, B, 1)
+        )
+
+    @torch.no_grad()
+    def compute_surprise(self, state, action, next_state):
+        """
+        Compute per-sample surprise: KL(posterior || prior) for each transition.
+        High KL = the model was surprised = novel/unexplored state.
+
+        Args:
+            state: (B, state_dim)
+            action: (B, action_dim)
+            next_state: (B, state_dim)
+        Returns:
+            surprise: (B,) — per-sample KL divergence (non-negative)
+        """
+        B = state.shape[0]
+
+        # Encode current state
+        _, _, z_t = self.encoder(state)
+
+        # Prior: what the model predicts
+        h_t = self.prior.get_initial_hidden(B, state.device)
+        h_next, mu_prior, log_var_prior = self.prior(h_t, z_t, action)
+
+        # Posterior: what actually happened
+        mu_post, log_var_post, _ = self.posterior(h_next, next_state)
+
+        # Per-sample KL (sum over latent dims, keep batch dim)
+        var_post = log_var_post.exp()
+        var_prior = log_var_prior.exp()
+        kl_per_sample = 0.5 * (
+            log_var_prior - log_var_post
+            + var_post / var_prior
+            + (mu_post - mu_prior).pow(2) / var_prior
+            - 1.0
+        ).sum(dim=-1)  # (B,)
+
+        return kl_per_sample.clamp(min=0.0)
+
+
+# Legacy aliases for backward compatibility with old checkpoints
+_DynamicsMLP = None  # Removed — old checkpoints will need RESET_TRAINING=true
+LatentDynamicsEnsemble = None  # Removed — replaced by LatentWorldModel
+

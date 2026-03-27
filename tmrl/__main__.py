@@ -56,6 +56,27 @@ def main(args):
                                    run_id=cfg.WANDB_RUN_ID)
         else:
             trainer.run()
+    elif args.consolidate:
+        # EWC: Consolidate current task before switching maps
+        logging.info("=== EWC CONSOLIDATION ===")
+        logging.info("Computing Fisher Information Matrix for current task...")
+        trainer = Trainer(training_cls=cfg_obj.TRAINER,
+                          server_ip=cfg.SERVER_IP_FOR_TRAINER,
+                          model_path=cfg.MODEL_PATH_TRAINER,
+                          checkpoint_path=cfg.CHECKPOINT_PATH,
+                          dump_run_instance_fn=cfg_obj.DUMP_RUN_INSTANCE_FN,
+                          load_run_instance_fn=cfg_obj.LOAD_RUN_INSTANCE_FN,
+                          updater_fn=cfg_obj.UPDATER_FN)
+        # The trainer's training agent has the consolidate_task method
+        if hasattr(trainer, 'training') and hasattr(trainer.training, 'agent'):
+            agent = trainer.training.agent
+            memory = trainer.training.memory if hasattr(trainer.training, 'memory') else None
+            agent.consolidate_task(memory=memory)
+            agent.save_ewc_state()
+            logging.info("EWC: Consolidation complete! You can now switch maps.")
+            logging.info("EWC: Set EWC_LAMBDA > 0 in config.json to enable (recommended: 5000)")
+        else:
+            logging.error("EWC: Could not access training agent. Make sure a checkpoint exists.")
     elif args.record_reward:
         record_reward_dist(path_reward=cfg.REWARD_PATH, use_keyboard=args.use_keyboard)
     elif args.check_env:
@@ -82,6 +103,7 @@ if __name__ == "__main__":
     parser.add_argument('--use-keyboard', dest='use_keyboard', action='store_true', help='modifier for --record-reward')
     parser.add_argument('--check-environment', dest='check_env', action='store_true', help='utility to check the environment')
     parser.add_argument('--wandb', dest='wandb', action='store_true', help='(use with --trainer) if you want to log results on Weights and Biases, use this option')
+    parser.add_argument('--consolidate', action='store_true', help='EWC: compute Fisher matrix for current task before switching maps')
     parser.add_argument('-d', '--config', type=json.loads, default={}, help='dictionary containing configuration options (modifiers) for the rtgym environment')
     arguments = parser.parse_args()
 

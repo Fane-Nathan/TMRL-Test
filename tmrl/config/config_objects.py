@@ -270,4 +270,4 @@ else:  # images
 
 DUMP_RUN_INSTANCE_FN = None if cfg.PRAGMA_LIDAR else None  # dump_run_instance_images_dataset
 LOAD_RUN_INSTANCE_FN = None if cfg.PRAGMA_LIDAR else None  # load_run_instance_images_dataset
-UPDATER_FN = update_run_instance if ALG_NAME in ["SAC", "REDQSAC"] else None
+UPDATER_FN = update_run_instance if ALG_NAME in ["SAC", "REDQSAC", "DROQSAC"] else None

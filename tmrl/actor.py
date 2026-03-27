@@ -133,8 +133,14 @@ class TorchActorModule(ActorModule, torch.nn.Module, ABC):
         torch.save(self.state_dict(), path)
 
     def load(self, path, device):
+        import logging
         self.device = device
-        self.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
+        state_dict = torch.load(path, map_location=self.device, weights_only=True)
+        result = self.load_state_dict(state_dict, strict=False)
+        if result.missing_keys:
+            logging.info(f"Actor load: missing keys (will use defaults): {result.missing_keys}")
+        if result.unexpected_keys:
+            logging.info(f"Actor load: unexpected keys (ignored): {result.unexpected_keys}")
         return self
 
     def act_(self, obs, test=False):

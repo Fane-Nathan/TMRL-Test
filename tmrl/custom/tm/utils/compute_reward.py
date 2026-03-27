@@ -101,6 +101,13 @@ class RewardFunction:
                 if index <= 0 or temp <= 0:
                     break
 
+            # Penalize backward movement proportionally (mirrors forward reward but negative)
+            if best_index < self.cur_idx:
+                reward = (best_index - self.cur_idx) / 100.0  # negative reward for going backward
+            else:
+                # No progress at all — flat penalty to discourage idling
+                reward = -0.02
+
             # If failure happens for too many steps, the episode terminates
             if self.step_counter > self.min_nb_steps_before_failure:
                 self.failure_counter += 1

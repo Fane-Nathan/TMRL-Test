@@ -171,8 +171,11 @@ class Memory(ABC):
 
     def __getitem__(self, item):
         transition = self.get_transition(item)
-        # Support context-augmented memories (8 values) and standard (7 values)
-        if len(transition) == 8:
+        # Support context-augmented memories (9 or 8 values) and standard (7 values)
+        img_context = None
+        if len(transition) == 9:
+            prev_obs, new_act, rew, new_obs, terminated, truncated, info, context, img_context = transition
+        elif len(transition) == 8:
             prev_obs, new_act, rew, new_obs, terminated, truncated, info, context = transition
         else:
             prev_obs, new_act, rew, new_obs, terminated, truncated, info = transition
@@ -185,7 +188,10 @@ class Memory(ABC):
             prev_obs, new_act, rew, new_obs, terminated, truncated = self.sample_preprocessor(prev_obs, new_act, rew, new_obs, terminated, truncated)
         terminated = np.float32(terminated)  # we don't want bool tensors
         truncated = np.float32(truncated)  # we don't want bool tensors
+        
         if context is not None:
+            if img_context is not None:
+                return prev_obs, new_act, rew, new_obs, terminated, truncated, context, img_context
             return prev_obs, new_act, rew, new_obs, terminated, truncated, context
         return prev_obs, new_act, rew, new_obs, terminated, truncated
 

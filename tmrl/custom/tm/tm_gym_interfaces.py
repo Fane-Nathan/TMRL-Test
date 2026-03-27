@@ -398,20 +398,27 @@ class TM2020InterfaceHybrid(TM2020Interface):
 
     def reset(self, seed=None, options=None):
         self.reset_common()
+        self.episode_wall_penalty = 0.0
         data, img, lidar = self.grab_data_and_img_and_lidar()
 
         speed = np.array([data[0]], dtype='float32')
         gear = np.array([data[9]], dtype='float32')
         rpm = np.array([data[10]], dtype='float32')
+        xyz = np.array([data[2], data[3], data[4]], dtype='float32')
+        progress_val = 0.0
+        progress = np.array([progress_val], dtype='float32')
+        self.prev_progress = progress_val
 
         self.img_hist.clear()
         for _ in range(self.img_hist_len):
             self.img_hist.append(img)
         imgs = np.array(list(self.img_hist))
 
+        crash = np.array([0.0], dtype='float32')
+        progress_gain = np.array([0.0], dtype='float32')
+
         # Obs structure matches the HybridNanoEffNet expectation:
-        # (speed, gear, rpm, images, lidar)
-        obs = [speed, gear, rpm, imgs, lidar]
+        obs = [speed, gear, rpm, imgs, lidar, xyz, progress, crash, progress_gain]
         self.reward_function.reset()
         return obs, {}
 
@@ -421,19 +428,49 @@ class TM2020InterfaceHybrid(TM2020Interface):
         speed = np.array([data[0]], dtype='float32')
         gear = np.array([data[9]], dtype='float32')
         rpm = np.array([data[10]], dtype='float32')
+        xyz = np.array([data[2], data[3], data[4]], dtype='float32')
 
         rew, terminated = self.reward_function.compute_reward(pos=np.array([data[2], data[3], data[4]]))
+        
+        # Calculate progress safely
+        datalen = getattr(self.reward_function, 'datalen', 1)
+        if datalen == 0: datalen = 1
+        curr_prog = self.reward_function.cur_idx / datalen
+        progress = np.array([curr_prog], dtype='float32')
+        if not hasattr(self, 'prev_progress'):
+            self.prev_progress = curr_prog
+        progress_gain = np.array([curr_prog - self.prev_progress], dtype='float32')
+        self.prev_progress = curr_prog
 
         self.img_hist.append(img)
         imgs = np.array(list(self.img_hist))
 
-        obs = [speed, gear, rpm, imgs, lidar]
-
         end_of_track = bool(data[8])
+        crash_val = 1.0 if (terminated and not end_of_track) else 0.0
+        crash = np.array([crash_val], dtype='float32')
+
+        obs = [speed, gear, rpm, imgs, lidar, xyz, progress, crash, progress_gain]
+
         info = {}
+        
+        # --- BALANCED REWARD: Wall-Riding Penalty ---
+        # DISABLED: Agent needs to learn to drive forward first.
+        # Re-enable once forward driving is stable.
+        # min_lidar_dist = np.min(lidar)
+        # if min_lidar_dist < 1.0:
+        #     wall_penalty = (1.0 - min_lidar_dist) * 0.003
+        #     rew -= wall_penalty
+        #     info['wall_penalty'] = wall_penalty
+        #     if not hasattr(self, 'episode_wall_penalty'):
+        #         self.episode_wall_penalty = 0.0
+        #     self.episode_wall_penalty += wall_penalty
+        # --------------------------------------------
+
         if end_of_track:
             terminated = True
             rew += self.finish_reward
+            if hasattr(self, 'episode_wall_penalty') and self.episode_wall_penalty > 0:
+                logging.info(f"🏁 Episode finished. Total LiDAR Wall-Riding Penalty: {-self.episode_wall_penalty:.2f}")
         rew += self.constant_penalty
         rew = np.float32(rew)
         return obs, rew, terminated, info
@@ -454,8 +491,12 @@ class TM2020InterfaceHybrid(TM2020Interface):
             img_space = spaces.Box(low=0.0, high=255.0, shape=(self.img_hist_len, h, w, 3))
 
         lidar_space = spaces.Box(low=0.0, high=np.inf, shape=(19,))
+        xyz_space = spaces.Box(low=-np.inf, high=np.inf, shape=(3,))
+        progress_space = spaces.Box(low=0.0, high=1.0, shape=(1,))
+        crash_space = spaces.Box(low=0.0, high=1.0, shape=(1,))
+        progress_gain_space = spaces.Box(low=-1.0, high=1.0, shape=(1,))
 
-        return spaces.Tuple((speed, gear, rpm, img_space, lidar_space))
+        return spaces.Tuple((speed, gear, rpm, img_space, lidar_space, xyz_space, progress_space, crash_space, progress_gain_space))
 
 
 if __name__ == "__main__":

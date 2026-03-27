@@ -1,7 +1,9 @@
 # standard library imports
 import itertools
+import pickle
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 
 # third-party imports
 import numpy as np
@@ -494,7 +496,7 @@ class SharedBackboneREDQSACAgent(TrainingAgent):
 
         # Keep shared representation updates slower than Q-head updates at high UTD.
         utd_ratio = max(1.0, float(self.q_updates_per_policy_update))
-        encoder_lr = self.lr_critic / utd_ratio
+        encoder_lr = min(self.lr_critic / utd_ratio, 3e-5)
         self.q_optimizer = Adam([
             {'params': self._q_params, 'lr': self.lr_critic},
             {'params': self._encoder_params, 'lr': encoder_lr},
@@ -627,6 +629,7 @@ class DroQSACAgent(TrainingAgent):
     - Supports high UTD (Update-to-Data) ratios (20+)
     - Dropout provides ensemble-like diversity for uncertainty
     - Compatible with shared backbone architecture
+    - EWC (Elastic Weight Consolidation) for continual learning across maps
     """
     model_nograd = cached_property(lambda self: no_grad(copy_shared(self.model)))
 
@@ -661,6 +664,17 @@ class DroQSACAgent(TrainingAgent):
         self.q_updates_per_policy_update = q_updates_per_policy_update
         self.alpha_floor = cfg.TMRL_CONFIG.get("ALG", {}).get("ALPHA_FLOOR", 0.08)
 
+        # EWC (Elastic Weight Consolidation) for continual learning
+        self.ewc_lambda = cfg.TMRL_CONFIG.get("ALG", {}).get("EWC_LAMBDA", 0.0)
+        self._ewc_fisher = {}   # Fisher Information Matrix (diagonal)
+        self._ewc_params = {}   # Optimal parameters from previous task
+        self._ewc_active = False
+        # Auto-load EWC state if it exists
+        ewc_path = Path(cfg.WEIGHTS_FOLDER if hasattr(cfg, 'WEIGHTS_FOLDER') else r'C:\Users\felix\TmrlData\weights') / 'ewc_state.pkl'
+        if ewc_path.exists() and self.ewc_lambda > 0:
+            self.load_ewc_state(str(ewc_path))
+            logging.info(f"EWC: Loaded consolidation state from {ewc_path}, lambda={self.ewc_lambda}")
+
         model = model if model is not None else model_cls(observation_space, action_space)
         self.model = model.to(device)
         self.model_target = no_grad(deepcopy(self.model))
@@ -694,8 +708,8 @@ class DroQSACAgent(TrainingAgent):
 
         # Scale encoder-related learning rates by UTD to prevent representation churn.
         utd_ratio = max(1.0, float(self.q_updates_per_policy_update))
-        encoder_lr = self.lr_critic / utd_ratio
-        context_lr = (self.lr_critic * 0.1) / utd_ratio
+        encoder_lr = min(self.lr_critic / utd_ratio, 3e-5)
+        context_lr = min(self.lr_critic / utd_ratio, 3e-5)
 
         optimizer_groups = [
             {'params': self._q_params, 'lr': self.lr_critic},
@@ -724,10 +738,312 @@ class DroQSACAgent(TrainingAgent):
         else:
             self.alpha_t = torch.full((dim_act,), float(self.alpha), device=self.device)
 
+        # ── World Model (RSSM) ─────────────────────────────────────────────
+        wm_cfg = cfg.TMRL_CONFIG.get("WORLD_MODEL", {})
+        self.wm_enabled = wm_cfg.get("ENABLED", False)
+        if self.wm_enabled:
+            from tmrl.custom.custom_models import LatentWorldModel
+            wm_state_dim = 28  # speed + gear + rpm + lidar(19) + xyz(3) + progress(1) + crash(1) + progress_gain(1)
+            wm_latent = wm_cfg.get("LATENT_DIM", 32)
+            wm_gru = wm_cfg.get("GRU_DIM", 128)
+            wm_hidden = wm_cfg.get("HIDDEN_DIM", 256)
+            wm_kl_free = wm_cfg.get("KL_FREE_NATS", 1.0)
+            self.dynamics = LatentWorldModel(
+                state_dim=wm_state_dim, action_dim=dim_act,
+                latent_dim=wm_latent, gru_dim=wm_gru,
+                hidden_dim=wm_hidden, kl_free_nats=wm_kl_free
+            ).to(device)
+            self.dynamics_optimizer = Adam(self.dynamics.parameters(),
+                                          lr=wm_cfg.get("MODEL_LR", 3e-4))
+            self.wm_warmup = wm_cfg.get("WARMUP_STEPS", 3000)
+            self.wm_horizon = wm_cfg.get("ROLLOUT_HORIZON", 15)
+            self.wm_batch_size = wm_cfg.get("IMAGINED_BATCH_SIZE", 256)
+            self.wm_train_steps = 0
+            logging.info(f"World Model RSSM: latent={wm_latent}, gru={wm_gru}, "
+                         f"horizon={self.wm_horizon}, warmup={self.wm_warmup}")
+            self.curiosity_scale = wm_cfg.get("CURIOSITY_SCALE", 0.1)
+            self._last_surprise_mean = 0.0  # tracks latest surprise for dynamic alpha floor
+
+            # Imagination Actor: learned policy for realistic imagined rollouts
+            from tmrl.custom.custom_models import ImaginationActor, RunningMeanStd
+            self.imag_actor = ImaginationActor(
+                state_dim=wm_state_dim, action_dim=dim_act,
+            ).to(device)
+            self.imag_actor_optimizer = Adam(self.imag_actor.parameters(), lr=1e-3)
+            self.imag_noise_scale = wm_cfg.get("IMAGINATION_NOISE_SCALE", 0.3)
+            self.curiosity_reward_clip = wm_cfg.get("CURIOSITY_REWARD_CLIP", 5.0)
+            self.curiosity_rms = RunningMeanStd()
+
     def get_actor(self):
         # Avoid deepcopy-based export for DroQ models:
         # certain parametrized tensors are not deepcopy-compatible in recent torch.
         return self.model.actor
+
+    # ── World Model helpers ──────────────────────────────────────────────
+
+    def _extract_critic_state(self, obs):
+        """
+        Extract the 28-dim Critic state vector from a batched observation tuple.
+        Returns: (B, 28) tensor on self.device
+        """
+        if len(obs) == 9:
+            speed, gear, rpm, images, lidar, xyz, progress, act1, act2 = obs
+            B = images.shape[0]
+            crash = torch.zeros((B, 1), device=speed.device)
+            progress_gain = torch.zeros((B, 1), device=speed.device)
+        else:
+            speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2 = obs
+            B = images.shape[0]
+            
+        speed = speed.view(B, -1)
+        gear = gear.view(B, -1)
+        rpm = rpm.view(B, -1)
+        lidar = lidar.view(B, -1)
+        xyz = xyz.view(B, -1)
+        progress = progress.view(B, -1)
+        crash = crash.view(B, -1)
+        progress_gain = progress_gain.view(B, -1)
+        return torch.cat((speed, gear, rpm, lidar, xyz, progress, crash, progress_gain), dim=-1)  # (B, 28)
+
+    def _train_dynamics(self, o, a, r, o2):
+        """
+        Train the RSSM world model on real transitions.
+        Uses reconstruction + KL divergence loss.
+        Args:
+            o:  observation tuple (batched)
+            a:  actions (B, 3)
+            r:  rewards (B,)
+            o2: next observation tuple (batched)
+        Returns:
+            metrics: dict with component losses for logging
+        """
+        state = self._extract_critic_state(o).detach()
+        next_state = self._extract_critic_state(o2).detach()
+        reward = r.unsqueeze(-1) if r.dim() == 1 else r  # (B, 1)
+
+        loss, metrics = self.dynamics.train_step(state, a, next_state, reward)
+
+        self.dynamics_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.dynamics.parameters(), 5.0)
+        self.dynamics_optimizer.step()
+
+        self.wm_train_steps += 1
+        return metrics
+
+    def _imagined_critic_update(self, o, ctx=None):
+        """
+        Generate imagined rollouts in latent space and perform Critic gradient updates.
+        Uses the RSSM prior to roll forward, decodes to critic state, then
+        computes proper 1-step TD targets using the actual Q-network pipeline.
+        """
+        state = self._extract_critic_state(o).detach()
+        B = min(state.shape[0], self.wm_batch_size)
+        state = state[:B]
+
+        # Policy function for imagination: use learned ImaginationActor + noise
+        noise_scale = getattr(self, 'imag_noise_scale', 0.3)
+        def policy_fn(critic_state):
+            with torch.no_grad():
+                base_action = self.imag_actor(critic_state)
+            noise = torch.randn_like(base_action) * noise_scale
+            return (base_action + noise).clamp(-1.0, 1.0)
+
+        # Imagine H steps into the future
+        with torch.no_grad():
+            imag_states, imag_rewards, imag_actions, imag_uncertainties = self.dynamics.imagine(
+                state, policy_fn, self.wm_horizon, self.gamma
+            )
+
+        # Use the last decoded state + reward for a 1-step TD critic update
+        # Take transitions from each horizon step as independent training data
+        H = imag_states.shape[0]
+        if H < 2:
+            return {"wm_imagined_steps": 0}
+
+        # Flatten horizon: treat each (s_t, a_t, r_t, s_{t+1}) as a transition
+        s_flat = imag_states[:-1].reshape(-1, self.dynamics.state_dim)    # ((H-1)*B, state_dim)
+        a_flat = imag_actions[:-1].reshape(-1, self.dynamics.action_dim)  # ((H-1)*B, 3)
+        r_flat = imag_rewards[:-1].reshape(-1, 1)                         # ((H-1)*B, 1)
+        ns_flat = imag_states[1:].reshape(-1, self.dynamics.state_dim)    # ((H-1)*B, state_dim)
+        u_t_flat = imag_uncertainties[:-1].reshape(-1, 1)                 # ((H-1)*B, 1)
+
+        # Compute target Q-values using imagined next states
+        with torch.no_grad():
+            a2 = self.imag_actor(ns_flat)
+            a2_noise = torch.randn_like(a2) * noise_scale
+            a2 = (a2 + a2_noise).clamp(-1.0, 1.0)
+            # Build critic_floats: the Q-heads take 34-dim (28 state + 3 act1 + 3 act2)
+            critic_ns = torch.cat([ns_flat, a2, a2], dim=-1)
+
+            # If using a Contextual model, append the 64-dim latent z vector
+            if hasattr(self.model, 'context_encoder'):
+                z_neutral = torch.zeros(ns_flat.shape[0], 64, device=self.device)  # CONTEXT_Z_DIM=64
+                critic_ns = torch.cat([critic_ns, z_neutral], dim=-1)
+
+            # Get FiLM params — use zeros (neutral modulation) for imagined data
+            if hasattr(self.model, 'film_generator'):
+                # In case z_neutral wasn't created above (model has film_generator but no context_encoder somehow)
+                z_for_film = torch.zeros(ns_flat.shape[0], 64, device=self.device)
+                film_params_neutral = self.model.film_generator(z_for_film)
+            else:
+                film_params_neutral = None
+
+            # Target Q from target network
+            q_next_list = [q(critic_ns, a2, film_params_neutral) for q in self.model_target.qs]
+            q_next_cat = torch.stack(q_next_list, -1)
+            min_q_next = torch.min(q_next_cat, dim=1)[0]  # (N,)
+
+            target_q = r_flat.squeeze(-1) + self.gamma * min_q_next  # (N,)
+
+        # Critic update on imagined transitions
+        critic_s = torch.cat([s_flat, a_flat, a_flat], dim=-1)
+        
+        if hasattr(self.model, 'context_encoder'):
+            z_neutral_grad = torch.zeros(s_flat.shape[0], 64, device=self.device)
+            critic_s = torch.cat([critic_s, z_neutral_grad], dim=-1)
+            
+        if hasattr(self.model, 'film_generator'):
+            z_for_film_grad = torch.zeros(s_flat.shape[0], 64, device=self.device)
+            film_params_grad = self.model.film_generator(z_for_film_grad)
+        else:
+            film_params_grad = None
+
+        q_pred_list = [q(critic_s, a_flat, film_params_grad) for q in self.model.qs]
+        q_pred_cat = torch.stack(q_pred_list, -1)  # (N, 2)
+        target_q_expanded = target_q.unsqueeze(-1).expand_as(q_pred_cat)
+
+        loss_unreduced = F.mse_loss(q_pred_cat, target_q_expanded, reduction='none')
+        
+        # === Verifier-Gated Imagination ===
+        # Compute trust metric m_t from uncertainty u_t
+        lambda_trust = cfg.TMRL_CONFIG.get("ALG", {}).get("VERIFIER_LAMBDA", 10.0)
+        m_t = torch.exp(-lambda_trust * u_t_flat)  # ((H-1)*B, 1)
+        m_t_expanded = m_t.expand_as(loss_unreduced)
+        
+        # Weight loss by trust metric
+        loss_q_imagined = (loss_unreduced * m_t_expanded).mean()
+
+        self.q_optimizer.zero_grad()
+        loss_q_imagined.backward()
+        torch.nn.utils.clip_grad_norm_(self._q_params, 1.0)
+        self.q_optimizer.step()
+
+        return {
+            "wm_imagined_steps": H * B,
+            "wm_imagined_q_loss": loss_q_imagined.item(),
+            "verifier_uncertainty_mean": u_t_flat.mean().item(),
+            "verifier_trust_mt_mean": m_t.mean().item(),
+        }
+
+    # ── EWC: Elastic Weight Consolidation ────────────────────────────────
+
+    def consolidate_task(self, memory=None, n_samples=2000):
+        """
+        Compute Fisher Information Matrix for the current task.
+        Call this BEFORE switching to a new map.
+        
+        The Fisher matrix captures which parameters are most important
+        for the current task. During future training, deviations from
+        these parameters are penalized proportionally to their importance.
+        """
+        logging.info("EWC: Computing Fisher Information Matrix...")
+        self.model.eval()
+        
+        fisher = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                fisher[name] = torch.zeros_like(param.data)
+        
+        # Use replay buffer if available, else use random noise
+        if memory is not None:
+            n_batches = max(1, n_samples // 64)
+            for _ in range(n_batches):
+                try:
+                    batch = memory.sample()
+                    # Forward pass to get loss
+                    img_ctx = None
+                    if len(batch) == 8:
+                        o, a, r, o2, d, _, ctx_full, img_ctx_full = batch
+                        ctx = ctx_full[:, :-1, :]
+                        img_ctx = img_ctx_full[:, :-1, :, :, :]
+                    elif len(batch) == 7:
+                        o, a, r, o2, d, _, ctx_full = batch
+                        ctx = ctx_full[:, :-1, :]
+                    else:
+                        o, a, r, o2, d, _ = batch
+                        ctx = None
+                    
+                    uses_context = hasattr(self.model, 'context_encoder') and self.model.context_encoder is not None
+                    if uses_context and ctx is not None:
+                        fused, critic, film, _ = self.model.forward_features(o, ctx, img_context=img_ctx)
+                    else:
+                        fused, critic, film, _ = self.model.forward_features(o)
+                    
+                    q_list = [q(fused, a, film) for q in self.model.qs]
+                    # Use Q-values as proxy for task importance
+                    for q_val in q_list:
+                        self.model.zero_grad()
+                        q_val.mean().backward(retain_graph=True)
+                        for name, param in self.model.named_parameters():
+                            if param.requires_grad and param.grad is not None:
+                                fisher[name] += param.grad.data.pow(2) / n_batches
+                except Exception as e:
+                    logging.warning(f"EWC: Skipping batch due to: {e}")
+                    continue
+        
+        # Normalize and store
+        for name in fisher:
+            fisher[name] = fisher[name].clamp(max=100.0)  # prevent extreme values
+        
+        self._ewc_fisher = fisher
+        self._ewc_params = {name: param.data.clone() 
+                           for name, param in self.model.named_parameters() 
+                           if param.requires_grad}
+        self._ewc_active = True
+        
+        n_params = sum(f.numel() for f in fisher.values())
+        mean_fisher = sum(f.mean().item() for f in fisher.values()) / max(len(fisher), 1)
+        logging.info(f"EWC: Consolidated {n_params:,} parameters, mean Fisher={mean_fisher:.4f}")
+        self.model.train()
+
+    def _ewc_loss(self):
+        """Compute EWC penalty: Σ F_i * (θ_i - θ*_i)²"""
+        loss = torch.tensor(0.0, device=self.device)
+        for name, param in self.model.named_parameters():
+            if name in self._ewc_fisher and name in self._ewc_params:
+                fisher = self._ewc_fisher[name]
+                optimal = self._ewc_params[name]
+                loss += (fisher * (param - optimal).pow(2)).sum()
+        return loss
+
+    def save_ewc_state(self, path=None):
+        """Save Fisher matrix + optimal params to disk."""
+        if path is None:
+            path = str(Path(r'C:\Users\felix\TmrlData\weights') / 'ewc_state.pkl')
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            'fisher': {k: v.cpu() for k, v in self._ewc_fisher.items()},
+            'params': {k: v.cpu() for k, v in self._ewc_params.items()},
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(state, f)
+        logging.info(f"EWC: Saved consolidation state to {path}")
+
+    def load_ewc_state(self, path=None):
+        """Load Fisher matrix + optimal params from disk."""
+        if path is None:
+            path = str(Path(r'C:\Users\felix\TmrlData\weights') / 'ewc_state.pkl')
+        if not Path(path).exists():
+            logging.warning(f"EWC: No state file at {path}")
+            return
+        with open(path, 'rb') as f:
+            state = pickle.load(f)
+        self._ewc_fisher = {k: v.to(self.device) for k, v in state['fisher'].items()}
+        self._ewc_params = {k: v.to(self.device) for k, v in state['params'].items()}
+        self._ewc_active = True
+        logging.info(f"EWC: Loaded consolidation state ({len(self._ewc_fisher)} params)")
+
 
     def train(self, batch):
         """
@@ -738,19 +1054,73 @@ class DroQSACAgent(TrainingAgent):
         # Backward compatibility for checkpoints (init logic bypassed)
         if not hasattr(self, "q_updates_per_policy_update"):
              self.q_updates_per_policy_update = cfg.TMRL_CONFIG["ALG"]["REDQ_Q_UPDATES_PER_POLICY_UPDATE"]
-        if not hasattr(self, "alpha_floor"):
-            self.alpha_floor = cfg.TMRL_CONFIG.get("ALG", {}).get("ALPHA_FLOOR", 0.08)
+        # Always read alpha_floor from live config (not checkpoint) so config changes take effect on restart.
+        self.alpha_floor = cfg.TMRL_CONFIG.get("ALG", {}).get("ALPHA_FLOOR", 0.08)
+
+        # Lazy-init World Model for checkpoints loaded via pickle (bypasses __init__)
+        if not hasattr(self, "wm_enabled"):
+            wm_cfg = cfg.TMRL_CONFIG.get("WORLD_MODEL", {})
+            self.wm_enabled = wm_cfg.get("ENABLED", False)
+            if self.wm_enabled:
+                from tmrl.custom.custom_models import LatentWorldModel
+                dim_act = self.action_space.shape[0]
+                wm_state_dim = 28  # speed + gear + rpm + lidar(19) + xyz(3) + progress(1) + crash(1) + progress_gain(1)
+                wm_latent = wm_cfg.get("LATENT_DIM", 32)
+                wm_gru = wm_cfg.get("GRU_DIM", 128)
+                wm_hidden = wm_cfg.get("HIDDEN_DIM", 256)
+                wm_kl_free = wm_cfg.get("KL_FREE_NATS", 1.0)
+                self.dynamics = LatentWorldModel(
+                    state_dim=wm_state_dim, action_dim=dim_act,
+                    latent_dim=wm_latent, gru_dim=wm_gru,
+                    hidden_dim=wm_hidden, kl_free_nats=wm_kl_free
+                ).to(self.device)
+                self.dynamics_optimizer = Adam(self.dynamics.parameters(),
+                                              lr=wm_cfg.get("MODEL_LR", 3e-4))
+                self.wm_warmup = wm_cfg.get("WARMUP_STEPS", 3000)
+                self.wm_horizon = wm_cfg.get("ROLLOUT_HORIZON", 15)
+                self.wm_batch_size = wm_cfg.get("IMAGINED_BATCH_SIZE", 256)
+                self.wm_train_steps = 0
+                logging.info(f"World Model RSSM (lazy init): latent={wm_latent}, gru={wm_gru}")
+                self.curiosity_scale = wm_cfg.get("CURIOSITY_SCALE", 0.1)
+                self._last_surprise_mean = 0.0
+
+        # Lazy-init ImaginationActor for checkpoints that predate this feature
+        if self.wm_enabled and not hasattr(self, 'imag_actor'):
+            from tmrl.custom.custom_models import ImaginationActor, RunningMeanStd
+            wm_cfg = cfg.TMRL_CONFIG.get("WORLD_MODEL", {})
+            dim_act = self.action_space.shape[0]
+            self.imag_actor = ImaginationActor(
+                state_dim=28, action_dim=dim_act,
+            ).to(self.device)
+            self.imag_actor_optimizer = Adam(self.imag_actor.parameters(), lr=1e-3)
+            self.imag_noise_scale = wm_cfg.get("IMAGINATION_NOISE_SCALE", 0.3)
+            self.curiosity_reward_clip = wm_cfg.get("CURIOSITY_REWARD_CLIP", 5.0)
+            self.curiosity_rms = RunningMeanStd()
+            logging.info("ImaginationActor lazy-initialized for existing checkpoint")
+
+        # Always refresh curiosity config from live config (so config.json changes
+        # take effect on trainer restart without needing RESET_TRAINING=true)
+        if self.wm_enabled:
+            wm_cfg_live = cfg.TMRL_CONFIG.get("WORLD_MODEL", {})
+            self.curiosity_scale = wm_cfg_live.get("CURIOSITY_SCALE", 0.1)
+            self.curiosity_reward_clip = wm_cfg_live.get("CURIOSITY_REWARD_CLIP", 5.0)
+
 
         self.i_update += 1
         # DroQ uses high UTD ratio
         update_policy = (self.i_update % self.q_updates_per_policy_update == 0)
 
-        # Unpack batch - support context-augmented (7 elements) and standard (6 elements)
-        if len(batch) == 7:
+        # Unpack batch - support context-augmented (7 or 8 elements) and standard (6 elements)
+        img_ctx = None
+        img_ctx_next = None
+        if len(batch) == 8:
+            o, a, r, o2, d, _, ctx_full, img_ctx_full = batch
+            ctx = ctx_full[:, :-1, :]
+            ctx_next = ctx_full[:, 1:, :]
+            img_ctx = img_ctx_full[:, :-1, :, :, :]
+            img_ctx_next = img_ctx_full[:, 1:, :, :, :]
+        elif len(batch) == 7:
             o, a, r, o2, d, _, ctx_full = batch
-            # Replay stores K+1 context steps so we can align Bellman targets.
-            # ctx      ends at t,      used with o
-            # ctx_next ends at t + 1,  used with o2
             ctx = ctx_full[:, :-1, :]
             ctx_next = ctx_full[:, 1:, :]
         else:
@@ -763,6 +1133,16 @@ class DroQSACAgent(TrainingAgent):
 
         # Get current alpha
         if self.learn_entropy_coef:
+            # Dynamic alpha floor: per-dimension (steer explores more than gas/brake)
+            # Steering needs more exploration (discovering turns is hard)
+            # Gas can exploit more (mostly accelerate)
+            # Brake needs least exploration
+            floor_multipliers = torch.tensor([1.5, 0.8, 0.5], device=self.device)  # [steer, gas, brake]
+            dynamic_floor = self.alpha_floor * floor_multipliers
+            # NOTE: curiosity is decoupled from alpha floor to prevent feedback loops.
+            # Curiosity only affects the reward signal, not entropy.
+            with torch.no_grad():
+                self.log_alpha.data = torch.max(self.log_alpha.data, torch.log(dynamic_floor))
             alpha_t = torch.exp(self.log_alpha.detach())
         else:
             alpha_t = self.alpha_t
@@ -777,53 +1157,66 @@ class DroQSACAgent(TrainingAgent):
             
             # BUG 1 FIX: Use CURRENT policy to get next action a2
             if uses_context and ctx_next is not None:
-                fused_o2_curr, film_o2_curr, _ = self.model.forward_features(o2, ctx_next)
+                fused_o2_curr, _, film_o2_curr, z_o2 = self.model.forward_features(o2, ctx_next, img_context=img_ctx_next)
             else:
-                fused_o2_curr, film_o2_curr, _ = self.model.forward_features(o2)
-            a2, logp_a2, _ = self.model.actor_from_features(fused_o2_curr, film_o2_curr)
+                fused_o2_curr, _, film_o2_curr, z_o2 = self.model.forward_features(o2)
+            a2, logp_a2, _ = self.model.actor_from_features(fused_o2_curr, film_o2_curr, z=z_o2)
             self.model.train()        # Re-enable dropout
 
             # Now evaluate the Q-value of that action using the TARGET network
             if uses_context and ctx_next is not None:
-                fused_o2_tgt, film_o2_tgt, _ = self.model_target.forward_features(o2, ctx_next)
+                _, critic_o2_tgt, film_o2_tgt, _ = self.model_target.forward_features(o2, ctx_next, img_context=img_ctx_next)
             else:
-                fused_o2_tgt, film_o2_tgt, _ = self.model_target.forward_features(o2)
+                _, critic_o2_tgt, film_o2_tgt, _ = self.model_target.forward_features(o2)
 
             # Use both Q-networks for min-Q
-            q_prediction_next_list = [q(fused_o2_tgt, a2, film_o2_tgt) for q in self.model_target.qs]
+            q_prediction_next_list = [q(critic_o2_tgt, a2, film_o2_tgt) for q in self.model_target.qs]
             q_prediction_next_cat = torch.stack(q_prediction_next_list, -1)
             min_q, _ = torch.min(q_prediction_next_cat, dim=1, keepdim=True)
             alpha_scalar = alpha_t.mean()
-            backup = r.unsqueeze(dim=-1) + self.gamma * (1 - d.unsqueeze(dim=-1)) * (min_q - alpha_scalar * logp_a2.unsqueeze(dim=-1))
+
+            # === Curiosity bonus: reward novel states the WM hasn't seen ===
+            r_augmented = r
+            if self.wm_enabled and self.wm_train_steps > self.wm_warmup:
+                state_cur = self._extract_critic_state(o).detach()
+                state_nxt = self._extract_critic_state(o2).detach()
+                surprise = self.dynamics.compute_surprise(state_cur, a, state_nxt)  # (B,)
+                # Normalize surprise with running stats for scale consistency
+                self.curiosity_rms.update(surprise)
+                surprise_norm = self.curiosity_rms.normalize(surprise)
+                clip_val = getattr(self, 'curiosity_reward_clip', 5.0)
+                surprise_norm = surprise_norm.clamp(-clip_val, clip_val)
+                curiosity_bonus = self.curiosity_scale * surprise_norm
+                r_augmented = r + curiosity_bonus
+
+            backup = r_augmented.unsqueeze(dim=-1) + self.gamma * (1 - d.unsqueeze(dim=-1)) * (min_q - alpha_scalar * logp_a2.unsqueeze(dim=-1))
 
         # === Critic update (with dropout) ===
         self.model.train()  # Ensure dropout is active
         if uses_context and ctx is not None:
-            fused_o_critic, film_o_critic, z_critic = self.model.forward_features(o, ctx)
+            _, critic_o_curr, film_o_critic, z_critic = self.model.forward_features(o, ctx, img_context=img_ctx)
         else:
-            fused_o_critic, film_o_critic, z_critic = self.model.forward_features(o)
+            _, critic_o_curr, film_o_critic, z_critic = self.model.forward_features(o)
         
-        q_prediction_list = [q(fused_o_critic, a, film_o_critic) for q in self.model.qs]
+        q_prediction_list = [q(critic_o_curr, a, film_o_critic) for q in self.model.qs]
         q_prediction_cat = torch.stack(q_prediction_list, -1)
         backup = backup.expand((-1, self.n)) if backup.shape[1] == 1 else backup
 
         loss_q = self.criterion(q_prediction_cat, backup)
 
-        # === Auxiliary multi-step reward prediction loss ===
-        loss_aux = torch.zeros(1, device=loss_q.device)
-        if uses_context and ctx is not None:
-            predicted_rewards = self.model.context_encoder.predict_reward(z_critic)  # list of (B,)
-            horizons = self.model.context_encoder.REWARD_HORIZONS  # [1, 3, 5]
-            K = ctx.shape[1]  # context window length
-            aux_losses = []
-            for pred, h in zip(predicted_rewards, horizons):
-                target_idx = K - h  # index from end of context window
-                if target_idx >= 0:
-                    target_reward = ctx[:, target_idx, 23]  # reward is at dim 23
-                    aux_losses.append(F.mse_loss(pred, target_reward))
-            if aux_losses:
-                loss_aux = torch.stack(aux_losses).mean()
-                loss_q = loss_q + 0.5 * loss_aux  # weighted auxiliary loss
+        # EWC: penalize deviation from previous task's optimal params
+        loss_ewc = torch.zeros(1, device=loss_q.device)
+        if self._ewc_active and self.ewc_lambda > 0:
+            loss_ewc = self._ewc_loss()
+            loss_q = loss_q + self.ewc_lambda * loss_ewc
+
+        # === Variational KL divergence loss (PEARL) ===
+        loss_kl = torch.zeros(1, device=loss_q.device)
+        if uses_context and ctx is not None and hasattr(self.model.context_encoder, 'last_kl_div'):
+            loss_kl = self.model.context_encoder.last_kl_div
+            # β-VAE weighting: small enough not to overwhelm RL signal
+            kl_beta = cfg.TMRL_CONFIG.get("ALG", {}).get("KL_BETA", 0.05)
+            loss_q = loss_q + kl_beta * loss_kl
 
         self.loss_q = loss_q.detach()
 
@@ -845,17 +1238,39 @@ class DroQSACAgent(TrainingAgent):
 
             with torch.no_grad():
                 if uses_context and ctx is not None:
-                    fused_o_actor, film_o_actor, _ = self.model.forward_features(o, ctx)
+                    fused_o_actor, critic_o_actor, film_o_actor, z_actor = self.model.forward_features(o, ctx, img_context=img_ctx)
                 else:
-                    fused_o_actor, film_o_actor, _ = self.model.forward_features(o)
-            pi, logp_pi, logp_per_dim = self.model.actor_from_features(fused_o_actor, film_o_actor)
+                    fused_o_actor, critic_o_actor, film_o_actor, z_actor = self.model.forward_features(o)
+            pi, logp_pi, logp_per_dim = self.model.actor_from_features(fused_o_actor, film_o_actor, z=z_actor)
             
-            qs_pi = [q(fused_o_actor, pi, film_o_actor) for q in self.model.qs]
+            qs_pi = [q(critic_o_actor, pi, film_o_actor) for q in self.model.qs]
             qs_pi_cat = torch.stack(qs_pi, -1)
             min_q_pi = torch.min(qs_pi_cat, dim=1, keepdim=True)[0]
-            entropy_cost = (alpha_t * logp_per_dim).sum(dim=-1)
-            loss_pi = (entropy_cost.unsqueeze(dim=-1) - min_q_pi).mean()
+            std_q_pi = torch.std(qs_pi_cat, dim=1, keepdim=True)
             
+            # Small SAC variant: uncertainty bonus and KL brake (ensemble disagreement)
+            unc_bonus = cfg.TMRL_CONFIG.get("ALG", {}).get("UNCERTAINTY_BONUS", 0.0)
+            kl_brake = cfg.TMRL_CONFIG.get("ALG", {}).get("KL_BRAKE", 0.0)
+            q_target_pi = min_q_pi + (unc_bonus - kl_brake) * std_q_pi
+
+            entropy_cost = (alpha_t * logp_per_dim).sum(dim=-1)
+            loss_pi = (entropy_cost.unsqueeze(dim=-1) - q_target_pi).mean()
+            # EWC: lighter penalty on actor (0.1x) to allow policy adaptation
+            if self._ewc_active and self.ewc_lambda > 0:
+                loss_pi = loss_pi + self.ewc_lambda * 0.1 * self._ewc_loss()
+
+            # === Deterministic Regularization (DPG) ===
+            # Force μ to independently produce high-Q actions (TD3-style gradient)
+            det_lambda = cfg.TMRL_CONFIG.get("ALG", {}).get("DET_REG_LAMBDA", 0.0)
+            loss_det = torch.zeros(1, device=self.device)
+            if det_lambda > 0:
+                pi_det, _, _ = self.model.actor_from_features(
+                    fused_o_actor, film_o_actor, test=True, with_logprob=False, z=z_actor)
+                qs_det = [q(critic_o_actor, pi_det, film_o_actor) for q in self.model.qs]
+                min_q_det = torch.min(torch.stack(qs_det, -1), dim=1)[0]
+                loss_det = -min_q_det.mean()
+                loss_pi = loss_pi + det_lambda * loss_det
+
             self.pi_optimizer.zero_grad()
             loss_pi.backward()
             # Per-module clipping for actor: std_net gets tighter clip
@@ -873,19 +1288,21 @@ class DroQSACAgent(TrainingAgent):
             if self.learn_entropy_coef:
                 with torch.no_grad():
                     if uses_context and ctx is not None:
-                        fused_alpha, film_alpha, _ = self.model.forward_features(o, ctx)
+                        fused_alpha, _, film_alpha, z_alpha = self.model.forward_features(o, ctx)
                     else:
-                        fused_alpha, film_alpha, _ = self.model.forward_features(o)
-                _, _, logp_per_dim_alpha = self.model.actor_from_features(fused_alpha, film_alpha)
+                        fused_alpha, _, film_alpha, z_alpha = self.model.forward_features(o)
+                _, _, logp_per_dim_alpha = self.model.actor_from_features(fused_alpha, film_alpha, z=z_alpha)
                 loss_alpha = -(self.log_alpha * (logp_per_dim_alpha.detach().mean(dim=0) + self.target_entropy)).sum()
                 self.alpha_optimizer.zero_grad()
                 loss_alpha.backward()
                 torch.nn.utils.clip_grad_norm_(self.log_alpha, 1.0)
                 self.alpha_optimizer.step()
 
-                # Entropy floor: prevent collapse below configured alpha floor.
+                # Apply per-dimension entropy floor (same as top of train())
+                floor_multipliers = torch.tensor([1.5, 0.8, 0.5], device=self.device)
+                dynamic_floor = self.alpha_floor * floor_multipliers
                 with torch.no_grad():
-                    self.log_alpha.clamp_(min=np.log(self.alpha_floor))
+                    self.log_alpha.data = torch.max(self.log_alpha.data, torch.log(dynamic_floor))
 
             self.loss_pi = loss_pi.detach()
 
@@ -899,16 +1316,25 @@ class DroQSACAgent(TrainingAgent):
         # Diagnostics: expose alpha and log_std trends to catch entropy collapse early.
         with torch.no_grad():
             if uses_context and ctx is not None:
-                fused_diag, film_diag, _ = self.model.forward_features(o, ctx)
+                fused_diag, critic_diag, film_diag, z_diag = self.model.forward_features(o, ctx)
             else:
-                fused_diag, film_diag, _ = self.model.forward_features(o)
-            log_std_raw_diag = self.model.actor.std_net(fused_diag)
+                fused_diag, critic_diag, film_diag, z_diag = self.model.forward_features(o)
+            if z_diag is None:
+                z_diag = torch.zeros(fused_diag.shape[0], 64, device=fused_diag.device)
+            actor_input_diag = torch.cat([fused_diag, z_diag], dim=-1)
+            log_std_raw_diag = self.model.actor.std_net(actor_input_diag)
             log_std_diag = core._compute_log_std_smooth(log_std_raw_diag)
 
         ret_dict = dict(
             loss_actor=self.loss_pi.detach().item(),
             loss_critic=self.loss_q.detach().item(),
         )
+        if update_policy and 'loss_det' in dir():
+            ret_dict["loss_det_reg"] = loss_det.detach().item() if isinstance(loss_det, torch.Tensor) else 0.0
+        if self._ewc_active:
+            ret_dict["ewc_loss"] = loss_ewc.detach().item() if 'loss_ewc' in dir() else 0.0
+        if uses_context:
+            ret_dict["kl_div_loss"] = loss_kl.detach().item() if isinstance(loss_kl, torch.Tensor) else 0.0
         ret_dict["debug_alpha_steer"] = alpha_t[0].item()
         ret_dict["debug_alpha_gas"] = alpha_t[1].item()
         ret_dict["debug_alpha_brake"] = alpha_t[2].item()
@@ -918,5 +1344,48 @@ class DroQSACAgent(TrainingAgent):
         if self.learn_entropy_coef and loss_alpha is not None:
             ret_dict["loss_entropy_coef"] = loss_alpha.detach().item()
             ret_dict["entropy_coef"] = alpha_t.mean().item()
+
+        # ── World Model training (RSSM) ─────────────────────────────────
+        if self.wm_enabled:
+            wm_metrics = self._train_dynamics(o, a, r, o2)
+            ret_dict["dynamics_loss"] = wm_metrics.get("wm_total_loss", 0.0)
+            ret_dict["wm_train_steps"] = self.wm_train_steps
+            ret_dict["wm_kl"] = wm_metrics.get("wm_kl", 0.0)
+            ret_dict["wm_recon_state"] = wm_metrics.get("wm_recon_state", 0.0)
+
+            # ── Train ImaginationActor to mimic real policy ─────────────
+            critic_state_for_imag = self._extract_critic_state(o).detach()
+            real_action = a.detach()
+            pred_action = self.imag_actor(critic_state_for_imag)
+            imag_actor_loss = F.mse_loss(pred_action, real_action)
+            self.imag_actor_optimizer.zero_grad()
+            imag_actor_loss.backward()
+            self.imag_actor_optimizer.step()
+            ret_dict["imag_actor_loss"] = imag_actor_loss.item()
+
+            if self.wm_train_steps > self.wm_warmup:
+                imag_metrics = self._imagined_critic_update(o, ctx=ctx if uses_context else None)
+                ret_dict.update(imag_metrics)
+
+                # Log curiosity bonus stats (uses normalized surprise)
+                state_cur = self._extract_critic_state(o).detach()
+                state_nxt = self._extract_critic_state(o2).detach()
+                with torch.no_grad():
+                    surprise = self.dynamics.compute_surprise(state_cur, a, state_nxt)
+                surprise_norm = self.curiosity_rms.normalize(surprise)
+                clip_val = getattr(self, 'curiosity_reward_clip', 5.0)
+                surprise_norm_clipped = surprise_norm.clamp(-clip_val, clip_val)
+                ret_dict["curiosity_surprise_raw_mean"] = surprise.mean().item()
+                self._last_surprise_mean = surprise.mean().item()  # track for diagnostics
+                ret_dict["curiosity_surprise_norm_mean"] = surprise_norm_clipped.mean().item()
+                ret_dict["curiosity_bonus_mean"] = (self.curiosity_scale * surprise_norm_clipped).mean().item()
+                ret_dict["curiosity_rms_mean"] = self.curiosity_rms.mean
+                ret_dict["curiosity_rms_std"] = self.curiosity_rms.var ** 0.5
+                # Log alpha floors (decoupled from curiosity)
+                floor_mults = torch.tensor([1.5, 0.8, 0.5])
+                base = self.alpha_floor * floor_mults
+                ret_dict["dynamic_alpha_floor_steer"] = base[0].item()
+                ret_dict["dynamic_alpha_floor_gas"] = base[1].item()
+                ret_dict["dynamic_alpha_floor_brake"] = base[2].item()
 
         return ret_dict
