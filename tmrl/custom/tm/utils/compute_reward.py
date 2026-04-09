@@ -81,43 +81,33 @@ class RewardFunction:
 
                 break  # we found the best index and can break the while loop
 
-        # The reward is then proportional to the number of passed indexes (i.e., track distance):
-        reward = (best_index - self.cur_idx) / 100.0
-
-        if best_index == self.cur_idx:  # if the best index didn't change, we rewind (more Markovian reward)
-            min_dist = np.inf
-            index = self.cur_idx
-
-            # Find the best matching index in rewind:
-            while True:
-                dist = np.linalg.norm(pos - self.data[index])
-                if dist <= min_dist:
-                    min_dist = dist
-                    best_index = index
-                    temp = self.nb_obs_backward
-                index -= 1
-                temp -= 1
-                # stop condition
-                if index <= 0 or temp <= 0:
-                    break
-
-            # Penalize backward movement proportionally (mirrors forward reward but negative)
-            if best_index < self.cur_idx:
-                reward = (best_index - self.cur_idx) / 100.0  # negative reward for going backward
-            else:
-                # No progress at all — flat penalty to discourage idling
-                reward = -0.02
-
-            # If failure happens for too many steps, the episode terminates
-            if self.step_counter > self.min_nb_steps_before_failure:
-                self.failure_counter += 1
-                if self.failure_counter > self.nb_zero_rew_before_failure:
-                    terminated = True
-
-        else:  # if we did progress on the track
-            self.failure_counter = 0  # we reset the counter triggering episode termination
-
-        self.cur_idx = best_index  # finally, we save our new best matching index
+        # The reward is proportional to the number of NEW passed indexes (track distance)
+        # We only reward strictly forward progress to prevent back-and-forth farming
+        progress = 0.0
+        if best_index > self.cur_idx:
+            progress = float(best_index - self.cur_idx)
+            reward = progress / 100.0
+            self.cur_idx = best_index # update our maximum reached index
+        else:
+            # We either idled or went backward. 
+            # We issue exactly 0.0 reward (no negative penalty, so the AI doesn't fear braking)
+            reward = 0.0
+            best_index = self.cur_idx # prevent cur_idx from moving backward
+            
+        # --- PACE CAR / ANTI-CRAWL MECHANIC ---
+        # The agent enjoys full immunity during the starting sequence
+        if self.step_counter > self.min_nb_steps_before_failure:
+            # The Pace Car builds pressure every single frame (+1 point)
+            self.failure_counter += 1
+            
+            # Driving fast relieves pressure (e.g. at least 1 index per 2 frames is breakeven speed)
+            if progress > 0.0:
+                self.failure_counter = max(0, self.failure_counter - int(progress * 2))
+                
+            # If the agent crawls or idles too long, the pressure bar fills up and terminates the run.
+            # We multiply by 4 to give the agent a massive 40-frame (2 second) buffer for taking corners.
+            if self.failure_counter > (self.nb_zero_rew_before_failure * 4):
+                terminated = True
 
         return reward, terminated
 
