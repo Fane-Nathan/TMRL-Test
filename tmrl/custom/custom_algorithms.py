@@ -763,6 +763,7 @@ class DroQSACAgent(TrainingAgent):
                          f"horizon={self.wm_horizon}, warmup={self.wm_warmup}")
             self.curiosity_scale = wm_cfg.get("CURIOSITY_SCALE", 0.1)
             self._last_surprise_mean = 0.0  # tracks latest surprise for dynamic alpha floor
+            self._last_verifier_trust = 1.0 # conviction score for dynamic alpha floor
 
             # Imagination Actor: learned policy for realistic imagined rollouts
             from tmrl.custom.custom_models import ImaginationActor, RunningMeanStd
@@ -805,7 +806,7 @@ class DroQSACAgent(TrainingAgent):
         progress_gain = progress_gain.view(B, -1)
         return torch.cat((speed, gear, rpm, lidar, xyz, progress, crash, progress_gain), dim=-1)  # (B, 28)
 
-    def _train_dynamics(self, o, a, r, o2):
+    def _train_dynamics(self, o, a, r, o2, context_z=None):
         """
         Train the RSSM world model on real transitions.
         Uses reconstruction + KL divergence loss.
@@ -814,6 +815,7 @@ class DroQSACAgent(TrainingAgent):
             a:  actions (B, 3)
             r:  rewards (B,)
             o2: next observation tuple (batched)
+            context_z: (B, 64) — PEARL context vector (optional)
         Returns:
             metrics: dict with component losses for logging
         """
@@ -821,7 +823,7 @@ class DroQSACAgent(TrainingAgent):
         next_state = self._extract_critic_state(o2).detach()
         reward = r.unsqueeze(-1) if r.dim() == 1 else r  # (B, 1)
 
-        loss, metrics = self.dynamics.train_step(state, a, next_state, reward)
+        loss, metrics = self.dynamics.train_step(state, a, next_state, reward, context_z=context_z)
 
         self.dynamics_optimizer.zero_grad()
         loss.backward()
@@ -831,7 +833,20 @@ class DroQSACAgent(TrainingAgent):
         self.wm_train_steps += 1
         return metrics
 
-    def _imagined_critic_update(self, o, ctx=None):
+    def _extract_prev_actions(self, obs, B=None):
+        """
+        Extract previous actions (act1, act2) from a batched observation tuple.
+        Returns: act1 (B, 3), act2 (B, 3)
+        """
+        if len(obs) == 9:
+            _, _, _, images, _, _, _, act1, act2 = obs
+        else:
+            _, _, _, images, _, _, _, _, _, act1, act2 = obs
+        if B is None:
+            B = images.shape[0]
+        return act1[:B].view(B, -1).detach(), act2[:B].view(B, -1).detach()
+
+    def _imagined_critic_update(self, o, ctx=None, context_z=None):
         """
         Generate imagined rollouts in latent space and perform Critic gradient updates.
         Uses the RSSM prior to roll forward, decodes to critic state, then
@@ -840,6 +855,11 @@ class DroQSACAgent(TrainingAgent):
         state = self._extract_critic_state(o).detach()
         B = min(state.shape[0], self.wm_batch_size)
         state = state[:B]
+        if context_z is not None:
+            context_z = context_z[:B].detach()
+
+        # Extract real previous actions from batch to seed action history
+        real_act1, real_act2 = self._extract_prev_actions(o, B)  # (B, 3) each
 
         # Policy function for imagination: use learned ImaginationActor + noise
         noise_scale = getattr(self, 'imag_noise_scale', 0.3)
@@ -849,10 +869,10 @@ class DroQSACAgent(TrainingAgent):
             noise = torch.randn_like(base_action) * noise_scale
             return (base_action + noise).clamp(-1.0, 1.0)
 
-        # Imagine H steps into the future
+        # Imagine H steps into the future (conditioned on PEARL context)
         with torch.no_grad():
             imag_states, imag_rewards, imag_actions, imag_uncertainties = self.dynamics.imagine(
-                state, policy_fn, self.wm_horizon, self.gamma
+                state, policy_fn, self.wm_horizon, self.gamma, context_z=context_z
             )
 
         # Use the last decoded state + reward for a 1-step TD critic update
@@ -861,6 +881,35 @@ class DroQSACAgent(TrainingAgent):
         if H < 2:
             return {"wm_imagined_steps": 0}
 
+        # === Build proper action history for critic input ===
+        # The real critic expects (state_28, act1=a_{t-1}, act2=a_{t-2}, z_64)
+        # We must track the 2-step action history through the imagination rollout.
+        #
+        # At horizon step h, the "previous actions" are:
+        #   act1_h = imag_actions[h-1]  (action taken at step h-1)
+        #   act2_h = imag_actions[h-2]  (action taken at step h-2)
+        #
+        # For h=0: act1=real_act1, act2=real_act2 (from the batch)
+        # For h=1: act1=imag_actions[0], act2=real_act1
+        # For h>=2: act1=imag_actions[h-1], act2=imag_actions[h-2]
+
+        # Build act1_history and act2_history for each horizon step (H, B, 3)
+        act1_history = []
+        act2_history = []
+        for h in range(H):
+            if h == 0:
+                act1_history.append(real_act1)
+                act2_history.append(real_act2)
+            elif h == 1:
+                act1_history.append(imag_actions[0])
+                act2_history.append(real_act1)
+            else:
+                act1_history.append(imag_actions[h - 1])
+                act2_history.append(imag_actions[h - 2])
+
+        act1_stack = torch.stack(act1_history, dim=0)  # (H, B, 3)
+        act2_stack = torch.stack(act2_history, dim=0)  # (H, B, 3)
+
         # Flatten horizon: treat each (s_t, a_t, r_t, s_{t+1}) as a transition
         s_flat = imag_states[:-1].reshape(-1, self.dynamics.state_dim)    # ((H-1)*B, state_dim)
         a_flat = imag_actions[:-1].reshape(-1, self.dynamics.action_dim)  # ((H-1)*B, 3)
@@ -868,22 +917,31 @@ class DroQSACAgent(TrainingAgent):
         ns_flat = imag_states[1:].reshape(-1, self.dynamics.state_dim)    # ((H-1)*B, state_dim)
         u_t_flat = imag_uncertainties[:-1].reshape(-1, 1)                 # ((H-1)*B, 1)
 
+        # Previous actions for current states (s_flat) and next states (ns_flat)
+        act1_s = act1_stack[:-1].reshape(-1, self.dynamics.action_dim)   # ((H-1)*B, 3)
+        act2_s = act2_stack[:-1].reshape(-1, self.dynamics.action_dim)   # ((H-1)*B, 3)
+        act1_ns = act1_stack[1:].reshape(-1, self.dynamics.action_dim)   # ((H-1)*B, 3)
+        act2_ns = act2_stack[1:].reshape(-1, self.dynamics.action_dim)   # ((H-1)*B, 3)
+
         # Compute target Q-values using imagined next states
         with torch.no_grad():
             a2 = self.imag_actor(ns_flat)
             a2_noise = torch.randn_like(a2) * noise_scale
             a2 = (a2 + a2_noise).clamp(-1.0, 1.0)
             # Build critic_floats: the Q-heads take 34-dim (28 state + 3 act1 + 3 act2)
-            critic_ns = torch.cat([ns_flat, a2, a2], dim=-1)
+            # Use proper action history for next-state critic input
+            critic_ns = torch.cat([ns_flat, act1_ns, act2_ns], dim=-1)
 
-            # If using a Contextual model, append the 64-dim latent z vector
-            if hasattr(self.model, 'context_encoder'):
-                z_neutral = torch.zeros(ns_flat.shape[0], 64, device=self.device)  # CONTEXT_Z_DIM=64
+            # Use real PEARL context for Q-network input during imagination
+            if context_z is not None:
+                z_imag = context_z.unsqueeze(0).expand(H-1, -1, -1).reshape(-1, 64)
+                critic_ns = torch.cat([critic_ns, z_imag], dim=-1)
+            else:
+                z_neutral = torch.zeros(ns_flat.shape[0], 64, device=self.device)
                 critic_ns = torch.cat([critic_ns, z_neutral], dim=-1)
 
             # Get FiLM params — use zeros (neutral modulation) for imagined data
             if hasattr(self.model, 'film_generator'):
-                # In case z_neutral wasn't created above (model has film_generator but no context_encoder somehow)
                 z_for_film = torch.zeros(ns_flat.shape[0], 64, device=self.device)
                 film_params_neutral = self.model.film_generator(z_for_film)
             else:
@@ -896,12 +954,16 @@ class DroQSACAgent(TrainingAgent):
 
             target_q = r_flat.squeeze(-1) + self.gamma * min_q_next  # (N,)
 
-        # Critic update on imagined transitions
-        critic_s = torch.cat([s_flat, a_flat, a_flat], dim=-1)
+        # Critic update on imagined transitions — use proper action history
+        critic_s = torch.cat([s_flat, act1_s, act2_s], dim=-1)
         
-        if hasattr(self.model, 'context_encoder'):
-            z_neutral_grad = torch.zeros(s_flat.shape[0], 64, device=self.device)
-            critic_s = torch.cat([critic_s, z_neutral_grad], dim=-1)
+        if context_z is not None:
+            z_imag_grad = context_z.unsqueeze(0).expand(H-1, -1, -1).reshape(-1, 64)
+            critic_s = torch.cat([critic_s, z_imag_grad], dim=-1)
+        else:
+            if hasattr(self.model, 'context_encoder'):
+                z_neutral_grad = torch.zeros(s_flat.shape[0], 64, device=self.device)
+                critic_s = torch.cat([critic_s, z_neutral_grad], dim=-1)
             
         if hasattr(self.model, 'film_generator'):
             z_for_film_grad = torch.zeros(s_flat.shape[0], 64, device=self.device)
@@ -1083,6 +1145,7 @@ class DroQSACAgent(TrainingAgent):
                 logging.info(f"World Model RSSM (lazy init): latent={wm_latent}, gru={wm_gru}")
                 self.curiosity_scale = wm_cfg.get("CURIOSITY_SCALE", 0.1)
                 self._last_surprise_mean = 0.0
+                self._last_verifier_trust = 1.0
 
         # Lazy-init ImaginationActor for checkpoints that predate this feature
         if self.wm_enabled and not hasattr(self, 'imag_actor'):
@@ -1137,8 +1200,12 @@ class DroQSACAgent(TrainingAgent):
             # Steering needs more exploration (discovering turns is hard)
             # Gas can exploit more (mostly accelerate)
             # Brake needs least exploration
+            trust = getattr(self, '_last_verifier_trust', 1.0)
+            trust_modulator = 1.0 + (0.5 - trust)
+            trust_modulator = max(0.2, min(2.0, trust_modulator))  # Clamp between 0.2x and 2.0x
+
             floor_multipliers = torch.tensor([1.5, 0.8, 0.5], device=self.device)  # [steer, gas, brake]
-            dynamic_floor = self.alpha_floor * floor_multipliers
+            dynamic_floor = (self.alpha_floor * trust_modulator) * floor_multipliers
             # NOTE: curiosity is decoupled from alpha floor to prevent feedback loops.
             # Curiosity only affects the reward signal, not entropy.
             with torch.no_grad():
@@ -1299,8 +1366,12 @@ class DroQSACAgent(TrainingAgent):
                 self.alpha_optimizer.step()
 
                 # Apply per-dimension entropy floor (same as top of train())
+                trust = getattr(self, '_last_verifier_trust', 1.0)
+                trust_modulator = 1.0 + (0.5 - trust)
+                trust_modulator = max(0.2, min(2.0, trust_modulator))
+
                 floor_multipliers = torch.tensor([1.5, 0.8, 0.5], device=self.device)
-                dynamic_floor = self.alpha_floor * floor_multipliers
+                dynamic_floor = (self.alpha_floor * trust_modulator) * floor_multipliers
                 with torch.no_grad():
                     self.log_alpha.data = torch.max(self.log_alpha.data, torch.log(dynamic_floor))
 
@@ -1347,7 +1418,10 @@ class DroQSACAgent(TrainingAgent):
 
         # ── World Model training (RSSM) ─────────────────────────────────
         if self.wm_enabled:
-            wm_metrics = self._train_dynamics(o, a, r, o2)
+            # Use z_critic (always computed) as context for the world model
+            # z_actor is only available during policy updates, but WM trains every step
+            wm_context_z = z_critic.detach() if z_critic is not None else None
+            wm_metrics = self._train_dynamics(o, a, r, o2, context_z=wm_context_z)
             ret_dict["dynamics_loss"] = wm_metrics.get("wm_total_loss", 0.0)
             ret_dict["wm_train_steps"] = self.wm_train_steps
             ret_dict["wm_kl"] = wm_metrics.get("wm_kl", 0.0)
@@ -1364,14 +1438,15 @@ class DroQSACAgent(TrainingAgent):
             ret_dict["imag_actor_loss"] = imag_actor_loss.item()
 
             if self.wm_train_steps > self.wm_warmup:
-                imag_metrics = self._imagined_critic_update(o, ctx=ctx if uses_context else None)
+                imag_metrics = self._imagined_critic_update(o, ctx=ctx if uses_context else None, context_z=wm_context_z)
                 ret_dict.update(imag_metrics)
+                self._last_verifier_trust = imag_metrics.get("verifier_trust_mt_mean", 1.0)
 
                 # Log curiosity bonus stats (uses normalized surprise)
                 state_cur = self._extract_critic_state(o).detach()
                 state_nxt = self._extract_critic_state(o2).detach()
                 with torch.no_grad():
-                    surprise = self.dynamics.compute_surprise(state_cur, a, state_nxt)
+                    surprise = self.dynamics.compute_surprise(state_cur, a, state_nxt, context_z=wm_context_z)
                 surprise_norm = self.curiosity_rms.normalize(surprise)
                 clip_val = getattr(self, 'curiosity_reward_clip', 5.0)
                 surprise_norm_clipped = surprise_norm.clamp(-clip_val, clip_val)
@@ -1383,7 +1458,9 @@ class DroQSACAgent(TrainingAgent):
                 ret_dict["curiosity_rms_std"] = self.curiosity_rms.var ** 0.5
                 # Log alpha floors (decoupled from curiosity)
                 floor_mults = torch.tensor([1.5, 0.8, 0.5])
-                base = self.alpha_floor * floor_mults
+                trust_mod = 1.0 + (0.5 - getattr(self, '_last_verifier_trust', 1.0))
+                trust_mod = max(0.2, min(2.0, trust_mod))
+                base = (self.alpha_floor * trust_mod) * floor_mults
                 ret_dict["dynamic_alpha_floor_steer"] = base[0].item()
                 ret_dict["dynamic_alpha_floor_gas"] = base[1].item()
                 ret_dict["dynamic_alpha_floor_brake"] = base[2].item()

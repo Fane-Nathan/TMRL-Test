@@ -2013,15 +2013,19 @@ class RSSMEncoder(nn.Module):
 class RSSMPrior(nn.Module):
     """
     Transition model: predicts next latent from GRU hidden state.
-    GRU input = concat(z_t, action_t), output h_{t+1}.
+    GRU input = concat(z_t, action_t, context_z), output h_{t+1}.
     Then h_{t+1} → (mu_prior, log_var_prior) for ẑ_{t+1}.
+    
+    context_z (from PEARL encoder) conditions the dynamics on the
+    agent's belief about the current track/task context.
     """
-    def __init__(self, latent_dim=32, action_dim=3, gru_dim=128, hidden_dim=256):
+    def __init__(self, latent_dim=32, action_dim=3, gru_dim=128, hidden_dim=256, context_z_dim=64):
         super().__init__()
         self.gru_dim = gru_dim
-        # Pre-process (z, action) before feeding to GRU
+        self.context_z_dim = context_z_dim
+        # Pre-process (z, action, context_z) before feeding to GRU
         self.pre_gru = nn.Sequential(
-            nn.Linear(latent_dim + action_dim, hidden_dim),
+            nn.Linear(latent_dim + action_dim + context_z_dim, hidden_dim),
             nn.SiLU(),
         )
         self.gru = nn.GRUCell(hidden_dim, gru_dim)
@@ -2031,19 +2035,22 @@ class RSSMPrior(nn.Module):
         nn.init.zeros_(self.log_var.weight)
         nn.init.constant_(self.log_var.bias, -2.0)
 
-    def forward(self, h, z, action):
+    def forward(self, h, z, action, context_z=None):
         """
         One-step transition.
         Args:
             h: (B, gru_dim) — previous GRU hidden state
             z: (B, latent_dim) — previous latent
             action: (B, action_dim)
+            context_z: (B, context_z_dim) — PEARL context vector (optional)
         Returns:
             h_next: (B, gru_dim)
             mu_prior: (B, latent_dim)
             log_var_prior: (B, latent_dim)
         """
-        x = self.pre_gru(torch.cat([z, action], dim=-1))
+        if context_z is None:
+            context_z = torch.zeros(z.shape[0], self.context_z_dim, device=z.device)
+        x = self.pre_gru(torch.cat([z, action, context_z], dim=-1))
         h_next = self.gru(x, h)
         mu_prior = self.mu(h_next)
         log_var_prior = self.log_var(h_next).clamp(-6, 2)
@@ -2271,20 +2278,22 @@ class LatentWorldModel(nn.Module):
         3. Repeat for H steps
     """
     def __init__(self, state_dim=26, action_dim=3, latent_dim=32,
-                 gru_dim=128, hidden_dim=256, kl_free_nats=1.0, num_reward_heads=5):
+                 gru_dim=128, hidden_dim=256, kl_free_nats=1.0, num_reward_heads=5,
+                 context_z_dim=64):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.latent_dim = latent_dim
         self.gru_dim = gru_dim
         self.kl_free_nats = kl_free_nats
+        self.context_z_dim = context_z_dim
 
         self.encoder = RSSMEncoder(state_dim, latent_dim, hidden_dim)
-        self.prior = RSSMPrior(latent_dim, action_dim, gru_dim, hidden_dim)
+        self.prior = RSSMPrior(latent_dim, action_dim, gru_dim, hidden_dim, context_z_dim)
         self.posterior = RSSMPosterior(gru_dim, state_dim, latent_dim, hidden_dim)
         self.decoder = RSSMDecoder(latent_dim, gru_dim, state_dim, hidden_dim, num_reward_heads)
 
-    def train_step(self, state, action, next_state, reward):
+    def train_step(self, state, action, next_state, reward, context_z=None):
         """
         Single training step on a batch of transitions.
         Args:
@@ -2292,6 +2301,7 @@ class LatentWorldModel(nn.Module):
             action: (B, action_dim)
             next_state: (B, state_dim)
             reward: (B, 1)
+            context_z: (B, context_z_dim) — PEARL context vector (optional)
         Returns:
             loss: scalar — total RSSM loss
             metrics: dict with component losses for logging
@@ -2302,9 +2312,9 @@ class LatentWorldModel(nn.Module):
         # 1. Encode current state
         _, _, z_t = self.encoder(state)
 
-        # 2. Prior: predict next latent from (h, z_t, action)
+        # 2. Prior: predict next latent from (h, z_t, action, context_z)
         h_t = self.prior.get_initial_hidden(B, state.device)
-        h_next, mu_prior, log_var_prior = self.prior(h_t, z_t, action)
+        h_next, mu_prior, log_var_prior = self.prior(h_t, z_t, action, context_z)
 
         # 3. Posterior: refine using actual next observation
         mu_post, log_var_post, z_post = self.posterior(h_next, next_state)
@@ -2358,7 +2368,7 @@ class LatentWorldModel(nn.Module):
         return kl.sum(dim=-1).mean()  # sum over latent, mean over batch
 
     @torch.no_grad()
-    def imagine(self, state, policy_fn, horizon, gamma=0.99):
+    def imagine(self, state, policy_fn, horizon, gamma=0.99, context_z=None):
         """
         Imagine future trajectories in latent space using the prior only.
         Args:
@@ -2366,6 +2376,7 @@ class LatentWorldModel(nn.Module):
             policy_fn: callable(critic_state) → action — the current policy
             horizon: int — number of imagination steps
             gamma: float — discount for computing returns
+            context_z: (B, context_z_dim) — PEARL context vector (optional)
         Returns:
             imagined_states: (H, B, state_dim) — decoded states
             imagined_rewards: (H, B, 1) — decoded mean rewards
@@ -2393,8 +2404,8 @@ class LatentWorldModel(nn.Module):
             action = policy_fn(decoded_state)
             all_actions.append(action)
 
-            # Step forward using prior (no observation needed)
-            h, mu_prior, log_var_prior = self.prior(h, z, action)
+            # Step forward using prior (no observation needed, context_z conditions dynamics)
+            h, mu_prior, log_var_prior = self.prior(h, z, action, context_z)
             # Use the mean (deterministic) during imagination for stability
             z = mu_prior
 
@@ -2417,7 +2428,7 @@ class LatentWorldModel(nn.Module):
         )
 
     @torch.no_grad()
-    def compute_surprise(self, state, action, next_state):
+    def compute_surprise(self, state, action, next_state, context_z=None):
         """
         Compute per-sample surprise: KL(posterior || prior) for each transition.
         High KL = the model was surprised = novel/unexplored state.
@@ -2426,6 +2437,7 @@ class LatentWorldModel(nn.Module):
             state: (B, state_dim)
             action: (B, action_dim)
             next_state: (B, state_dim)
+            context_z: (B, context_z_dim) — PEARL context vector (optional)
         Returns:
             surprise: (B,) — per-sample KL divergence (non-negative)
         """
@@ -2434,9 +2446,9 @@ class LatentWorldModel(nn.Module):
         # Encode current state
         _, _, z_t = self.encoder(state)
 
-        # Prior: what the model predicts
+        # Prior: what the model predicts (conditioned on PEARL context)
         h_t = self.prior.get_initial_hidden(B, state.device)
-        h_next, mu_prior, log_var_prior = self.prior(h_t, z_t, action)
+        h_next, mu_prior, log_var_prior = self.prior(h_t, z_t, action, context_z)
 
         # Posterior: what actually happened
         mu_post, log_var_post, _ = self.posterior(h_next, next_state)
